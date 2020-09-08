@@ -29,7 +29,42 @@
 
 #include "classification_sample_async.h"
 
+#include <hetero/hetero_plugin_config.hpp>
+#include <ngraph/function.hpp>
+#include <ngraph/variant.hpp>
+#include <ngraph/graph_util.hpp>
+#include <ngraph/op/result.hpp>
+#include <ngraph/op/parameter.hpp>
+#include <ngraph/op/util/op_types.hpp>
+#include <ngraph/rt_info.hpp>
+
 using namespace InferenceEngine;
+
+void assignAffinities(InferenceEngine::CNNNetwork & network, InferenceEngine::Core & core, std::string & deviceType) {
+    std::vector<std::string> availableDevices = core.GetMetric("CPU", Metrics::METRIC_AVAILABLE_DEVICES);
+
+    // check that provided devices are available
+    if (availableDevices.empty()) {
+        throw std::logic_error("There is not devices of specified type. Please, specify device type like MYRIAD, FPGA, etcc");
+    }
+
+    std::string particularDevice = "CPU";
+    std::string heteroDevice = "HETERO:" + particularDevice;
+
+    // distribute layers among 2 devices using a cut point
+    // `layerToCut` is sent to next device
+    std::cout << "Manual distribution logic is used" << std::endl;
+    auto ngraphFunction = network.getFunction();
+    auto orderedOps = ngraphFunction->get_ordered_ops();
+
+    for (auto&& node : orderedOps) {
+        auto& nodeInfo = node->get_rt_info();
+        nodeInfo["affinity"] = std::make_shared<ngraph::VariantWrapper<std::string>> (particularDevice);
+    }
+
+    std::cout << "The topology " << network.getName() << " will be run on " << heteroDevice << " device" << std::endl;
+    deviceType = "HETERO:CPU";
+}
 
 bool ParseAndCheckCommandLine(int argc, char *argv[]) {
     // ---------------------------Parsing and validation of input args--------------------------------------
@@ -55,6 +90,8 @@ bool ParseAndCheckCommandLine(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
+//    MB_models/INT8/public/ResNet-50/resnet_50_pytorch_dense_int8_IRv10_fp16_to_int8.xm
+//   KMB_models/INT8/public/ResNet-50/resnet_50_pytorch_dense_int8_IRv10_from_fp32.xml
     try {
         slog::info << "InferenceEngine: " << GetInferenceEngineVersion() << slog::endl;
 
@@ -95,6 +132,9 @@ int main(int argc, char *argv[]) {
 
         /** Read network model **/
         CNNNetwork network = ie.ReadNetwork(FLAGS_m);
+
+        assignAffinities(network, ie, FLAGS_d);
+
         // -----------------------------------------------------------------------------------------------------
 
         // --------------------------- 3. Configure input & output ---------------------------------------------

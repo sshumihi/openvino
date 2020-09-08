@@ -6,3 +6,5 @@ ie_add_sample(NAME classification_sample_async
               SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp"
               HEADERS classification_sample_async.h
               DEPENDENCIES format_reader)
+find_package(ngraph REQUIRED)
+target_link_libraries(classification_sample_async PRIVATE ${NGRAPH_LIBRARIES})
