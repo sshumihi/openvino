@@ -48,18 +48,28 @@ void assignAffinities(InferenceEngine::CNNNetwork & network, InferenceEngine::Co
         throw std::logic_error("There is not devices of specified type. Please, specify device type like MYRIAD, FPGA, etcc");
     }
 
-    std::string particularDevice = "CPU";
-    std::string heteroDevice = "HETERO:" + particularDevice;
+    std::string particularDevice1 = "CPU";
+    std::string particularDevice2 = "HDDL2";
+
+    std::string heteroDevice = "HETERO:" + particularDevice1;
+    std::string particularDevice = particularDevice1;
 
     // distribute layers among 2 devices using a cut point
     // `layerToCut` is sent to next device
     std::cout << "Manual distribution logic is used" << std::endl;
     auto ngraphFunction = network.getFunction();
     auto orderedOps = ngraphFunction->get_ordered_ops();
+    const std::string layerToCut = "prob";
 
     for (auto&& node : orderedOps) {
         auto& nodeInfo = node->get_rt_info();
+        if (layerToCut == node->get_friendly_name()) {
+            std::cout << "===== layer will be set to HDDL" << '\n';
+            particularDevice = particularDevice2;
+            heteroDevice += "," + particularDevice;
+        }
         nodeInfo["affinity"] = std::make_shared<ngraph::VariantWrapper<std::string>> (particularDevice);
+        std::cout << particularDevice << " | " << node->get_name() << " | " <<  node->get_friendly_name() << '\n';
     }
 
     std::cout << "The topology " << network.getName() << " will be run on " << heteroDevice << " device" << std::endl;
