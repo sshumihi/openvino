@@ -128,12 +128,21 @@ DynamicPipeline::DynamicPipeline(const Config& config,
             //     static_cast<unsigned char*>(data) +
             //         (i * input_tensors.at(io_index).at(0)->get_byte_size()) / _number_of_command_lists);
 
-            std::cout << " update tensor property for input desc index:" << desc.idx << std::endl;
+            std::cout << desc.idx << std::endl;
+
+            // Conver byte strides to element strides
+            ov::Strides element_strides = input_tensors.at(io_index).at(0)->get_strides();
+            const size_t element_size = input_tensors.at(io_index).at(0)->get_element_type().size();
+            for (auto& stride : element_strides) {
+                stride /= element_size;  
+            }
+
+            _logger.warning("Setting argument property for input index: %zu, desc.idx: %u", io_index, desc.idx);
             irGraph->set_argument_property(
                 desc.idx,
                 static_cast<unsigned char*>(data) +
                     (i * input_tensors.at(io_index).at(0)->get_byte_size()) / _number_of_command_lists,
-                input_tensors.at(io_index).at(0)->get_strides(),
+                element_strides,
                 input_tensors.at(io_index).at(0)->get_shape());
 
             ++io_index;
@@ -154,12 +163,18 @@ DynamicPipeline::DynamicPipeline(const Config& config,
             //     static_cast<unsigned char*>(data) +
             //         (i * output_tensors.at(io_index)->get_byte_size()) / _number_of_command_lists);
 
-            std::cout << " update tensor property for output desc index:" << std::endl;
+            ov::Strides element_strides = output_tensors.at(io_index).at(0)->get_strides();
+            const size_t element_size = output_tensors.at(io_index).at(0)->get_element_type().size();
+            for (auto& stride : element_strides) {
+                stride /= element_size;  
+            }
+
+            _logger.warning("Setting argument property for output index: %zu, desc.idx: %u", io_index, desc.idx);
             irGraph->set_argument_property(
                 desc.idx,
                 static_cast<unsigned char*>(data) +
                     (i * output_tensors.at(io_index)->get_byte_size()) / _number_of_command_lists,
-                output_tensors.at(io_index)->get_strides(),
+                element_strides,
                 output_tensors.at(io_index)->get_shape());
 
             ++io_index;
