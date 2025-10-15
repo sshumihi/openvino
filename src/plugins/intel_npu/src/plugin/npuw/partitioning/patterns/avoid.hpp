@@ -34,6 +34,12 @@ public:
     SinCos(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& avoid_device);
 };
 
+class DynamicNodes : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::patterns::avoid::DynamicNodes");
+    DynamicNodes(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, const std::string& avoid_device);
+};
+
 }  // namespace avoid
 }  // namespace patterns
 }  // namespace npuw

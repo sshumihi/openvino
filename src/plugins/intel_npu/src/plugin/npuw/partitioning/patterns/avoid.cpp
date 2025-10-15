@@ -3,6 +3,7 @@
 //
 
 #include "avoid.hpp"
+#include <openvino/op/op.hpp>
 
 #include "../../logging.hpp"
 #include "../online/group.hpp"     // online::Group
@@ -105,6 +106,46 @@ SinCos::SinCos(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot, cons
     };
     register_matcher(std::make_shared<opp::Matcher>(sin_cos, "TagSinCos"), std::move(callback));
 }
+
+DynamicNodes::DynamicNodes(const std::shared_ptr<ov::npuw::online::Snapshot>& snapshot,
+                           const std::string& avoid_device) {
+    auto node_to_gptr = snapshot->getNodeToGroupMap();
+
+    auto dynamic_op = opp::wrap_type<ov::op::Op>([node_to_gptr](const std::shared_ptr<ov::Node>& node) {
+        if (!node_to_gptr || node_to_gptr->find(node) == node_to_gptr->end()) {
+            return false;
+        }
+
+        const auto inputs_count = node->get_input_size();
+        return inputs_count > 0 && inputs_count <= 7;
+    });
+
+    auto callback = [=](ov::pass::pattern::Matcher& m) {
+        auto& node_to_output = m.get_pattern_value_map();
+
+        auto matched_dynamic_op = node_to_output.at(dynamic_op).get_node_shared_ptr();
+
+        const auto map_it = node_to_gptr->find(matched_dynamic_op);
+        if (map_it == node_to_gptr->end()) {
+            return false;
+        }
+
+        const auto outputs_count = matched_dynamic_op->get_output_size();
+        for (size_t output_idx = 0; output_idx < outputs_count; ++output_idx) {
+            if (matched_dynamic_op->get_output_partial_shape(output_idx).is_dynamic()) {
+                map_it->second->avoid(avoid_device);
+                break;
+            }
+        }
+
+        return false;  // root hasn't changed
+    };
+
+    register_matcher(std::make_shared<opp::Matcher>(dynamic_op, "TagDynamicNodesAvoid"), std::move(callback));
+}
+
+
+
 }  // namespace avoid
 }  // namespace patterns
 }  // namespace npuw
