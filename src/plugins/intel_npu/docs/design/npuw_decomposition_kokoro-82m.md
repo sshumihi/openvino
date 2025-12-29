@@ -167,18 +167,18 @@ graph TD
     subgraph Predictor Output
         Unsqueeze["Unsqueeze_2"]:::op
         
-        Feat1["Feature Tensor 1<br>1x640x336"]:::tensor
-        Feat2["Feature Tensor 2<br>1x512x336"]:::tensor
+        Feat1["Feature Tensor 1<br>1 x 640 x tokens"]:::tensor
+        Feat2["Feature Tensor 2<br>1 x 512 x tokens"]:::tensor
         
-        AlignMatrix["pred_aln_trg<br>1x336xTime"]:::tensor
+        AlignMatrix["pred_aln_trg<br>1 x tokens x Time"]:::tensor
         
         Unsqueeze --> AlignMatrix
     end
 
     subgraph The_Bridge ["Alignment / Cutting Point"]
         direction TB
-        MM1["MatMul_1<br>in1: 1×640×336<br>in2: 1×336xTime<br>out: 1x640xTime"]:::cut
-        MM2["MatMul<br>in1: 1×512×336<br>in2: 1×336xTime<br>out: 1x512xTime"]:::cut
+        MM1["MatMul_1<br>in1: 1 × 640 × tokens<br>in2: 1 × tokens x Time<br>out: 1 x 640 x Time"]:::cut
+        MM2["MatMul<br>in1: 1 × 512 × tokens<br>in2: 1 × tokens x Time<br>out: 1 x 512 x Time"]:::cut
     end
     
     %% Connections
