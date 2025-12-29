@@ -189,10 +189,22 @@ graph TD
     Feat2 --> MM2
 ```
 
-### Manual alignment
+### Manual alignment + loop execution
 
 The host application will implement the alignment logic (equivalent to `torch.repeat_interleave` followed by matrix multiplication)
-TBD
+First, create `idx` array which can be used in Gather operation to extract features vectors from matrix.  
+```
+pred_dur        idx
+[1, 2, 3, 1] -> [0, 1, 1, 2, 2, 2, 3]
+```
+On this stage we moved from token to time domain.  
+
+Then, in loop, using fixed block size (limiting maximum time frames processed at once), we need to create aligned in time feature matrix
+```
+Features (L=3)      Indices (idx)        Destination (block=5)  
+[ A | B | C ]   <-- [0, 0, 1, 2, 2] --> [ A | A | B | C | C ]
+```
+Run model b using it and process audio output (add result / handle padding).
 
 ## Alternatives considered
 
