@@ -125,19 +125,19 @@ Operation: Y=F×A
 F - Feature matrix \[Features, Tokens\] for two tokens (A & B)
 
 $$
-F=\left(\begin{matrix}A_{1}&B_{1}\\A_{2}&B_{2}\\A_{3}&B_{3}\end{matrix}\right)
+F=\begin{bmatrix}A_{1}&B_{1} \\\ A_{2}&B_{2} \\\ A_{3}&B_{3}\end{bmatrix}
 $$
 
 A - Alignment Matrix \[Tokens, Time\] (Sparse, mostly zeros)
 
 $$
-A=\left(\begin{matrix}1&1&0\\0&0&1\\\end{matrix}\right)
+A=\begin{bmatrix} 1&1&0 \\\ 0&0&1  \end{bmatrix}
 $$
 
 Y - features in time domain \[Features, Time\]
 
 $$
-Y=\left(\begin{matrix}A_{1}&A_{1}&B_{1}\\A_{2}&A_{2}&B_{2}\\A_{3}&A_{3}&B_{3}\end{matrix}\right)
+Y= \begin{bmatrix} A_{1}&A_{1}&B_{1} \\\ A_{2}&A_{2}&B_{2} \\\ A_{3}&A_{3}&B_{3} \end{bmatrix}
 $$
 
 ## Design
