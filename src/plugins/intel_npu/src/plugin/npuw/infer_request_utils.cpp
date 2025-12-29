@@ -158,3 +158,18 @@ std::optional<ov::Output<const ov::Node>> ov::npuw::util::find_port_by_name(
     }
     return std::make_optional(*it);
 }
+
+std::optional<ov::Output<const ov::Node>> ov::npuw::util::find_port_by_names(
+    const std::vector<ov::Output<const ov::Node>>& ports,
+    const std::unordered_set<std::string>& names) {
+    for (const auto& port: ports) {
+        const auto& port_names = port.get_names();
+        for (const auto& port_name: port_names) {
+            if (names.count(port_name)) {
+                return std::make_optional(port);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
