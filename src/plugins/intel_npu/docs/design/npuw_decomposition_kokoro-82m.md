@@ -219,18 +219,18 @@ For example, if `block_size` is 100 and we want 10 frames of overlap on each sid
 ```mermaid
 graph TD
     subgraph Stream [Audio Stream Construction]
-        B1["Block 1 Input: [0, 100]<br>Valid Output: [0, 90]"]
-        B2["Block 2 Input: [80, 180]<br>Valid Output: [90, 170]"]
-        B3["Block 3 Input: [160, 260]<br>Valid Output: [170, 260]"]
+        B1["Block 1 Input: [0, 100]"]
+        B2["Block 2 Input: [80, 180]"]
+        B3["Block 3 Input: [160, 260]"]
 
         B1_Valid["Valid: [0, 90]"]:::keep
-        B1_Bad["Overlap/Future: [90, 100]"]:::discard
+        B1_Bad["Bad: [90, 100]"]:::discard
         
-        B2_BadL["Overlap/Past: [80, 90]"]:::discard
+        B2_BadL["Bad: [80, 90]"]:::discard
         B2_Valid["Valid: [90, 170]"]:::keep
-        B2_BadR["Overlap/Future: [170, 180]"]:::discard
+        B2_BadR["Bad: [170, 180]"]:::discard
         
-        B3_BadL["Overlap/Past: [160, 170]"]:::discard
+        B3_BadL["Bad: [160, 170]"]:::discard
         B3_Valid["Valid: [170, 260]"]:::keep
         
         B1 --> B1_Valid & B1_Bad
