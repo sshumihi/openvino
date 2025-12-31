@@ -206,6 +206,47 @@ Features (L=3)      Indices (idx)        Destination (block=5)
 ```
 Run model b using it and process audio output (add result / handle padding).
 
+### Overlap logic 
+
+Decoder part of the model (model b) rely on sequence of tokens in order to generate audio. Thus problem with fading and clicks on edges appear, if we split continues feature vectors into chunks. As a solution approach with overlapping between two blocks can be used, so each block will contain some information from previous block. By introducing overlapping we now can cut part of "invalid" audio (from beginning and end block).
+
+For example, if `block_size` is 100 and we want 10 frames of overlap on each side:
+- We feed 100 frames to the model (fixed input size).
+- The middle 80 frames are new valid content (`step`).
+- The first 10 frames are context from the previous block.
+- The last 10 frames are context for the next block.
+
+```mermaid
+graph TD
+    subgraph Stream [Audio Stream Construction]
+        B1["Block 1 Input: [0, 100]<br>Valid Output: [0, 90]"]
+        B2["Block 2 Input: [80, 180]<br>Valid Output: [90, 170]"]
+        B3["Block 3 Input: [160, 260]<br>Valid Output: [170, 260]"]
+
+        B1_Valid["Valid: [0, 90]"]:::keep
+        B1_Bad["Overlap/Future: [90, 100]"]:::discard
+        
+        B2_BadL["Overlap/Past: [80, 90]"]:::discard
+        B2_Valid["Valid: [90, 170]"]:::keep
+        B2_BadR["Overlap/Future: [170, 180]"]:::discard
+        
+        B3_BadL["Overlap/Past: [160, 170]"]:::discard
+        B3_Valid["Valid: [170, 260]"]:::keep
+        
+        B1 --> B1_Valid & B1_Bad
+        B2 --> B2_BadL & B2_Valid & B2_BadR
+        B3 --> B3_BadL & B3_Valid
+        
+        Final[Final Audio]
+        B1_Valid --> Final
+        B2_Valid --> Final
+        B3_Valid --> Final
+    end
+
+    classDef keep fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px;
+    classDef discard fill:#ffccbc,stroke:#d84315,stroke-width:2px,stroke-dasharray: 5 5;
+```   
+
 ## Alternatives considered
 
 ### A. Static Compilation
