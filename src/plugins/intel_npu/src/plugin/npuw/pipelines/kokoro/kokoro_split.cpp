@@ -16,6 +16,7 @@
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/util/node_util.hpp"
+#include "openvino/pass/serialize.hpp"
 
 namespace ov::npuw {
 
@@ -60,6 +61,69 @@ void replace_text_mask_with_parameter(std::shared_ptr<ov::Model>& model) {
     text_mask_node->output(0).replace(text_mask_param->output(0));
 
     model->add_parameters({text_mask_param});
+    model->validate_nodes_and_infer_types();
+}
+
+// TO-DO Should be replaced with proper LSTMSequence implementation which can accept such inputs.
+// Replace the input_lengths value (derived from ShapeOf(input_ids)) with a Parameter input.
+// In the static model, ShapeOf(input_ids) always returns the padded size (e.g. 512), which
+// feeds as sequence_lengths into all LSTMSequence ops (from pack_padded_sequence in PyTorch).
+// This makes the LSTMs process all 512 positions including padding, corrupting hidden states
+// (especially in bidirectional LSTMs where the backward pass starts from padding).
+// By exposing input_lengths as a Parameter, the host can provide the real sequence length.
+//
+// NOTE: The NPU compiler frontend (IE.cpp) only accepts sequence_lengths that is either
+// a Constant or a Parameter node — any intermediate op (like TopK) causes a rejection.
+// Therefore we must connect ALL LSTMSequence port 3 inputs directly to the Parameter.
+void replace_input_lengths_with_parameter(std::shared_ptr<ov::Model>& model) {
+    // Find the Broadcast node whose output tensor has the name "input_lengths".
+    // This is the node that broadcasts ShapeOf(input_ids)[1] → [batch_size].
+    std::shared_ptr<ov::Node> input_lengths_node;
+    for (const auto& op : model->get_ops()) {
+        for (size_t i = 0; i < op->get_output_size(); ++i) {
+            if (op->output(i).get_names().count("input_lengths")) {
+                input_lengths_node = op;
+                break;
+            }
+        }
+        if (input_lengths_node)
+            break;
+    }
+
+    if (!input_lengths_node) {
+        LOG_WARN("input_lengths node not found — skipping replacement");
+        return;
+    }
+
+    LOG_DEBUG("replacing input_lengths (ShapeOf-derived) with Parameter input");
+
+    // input_lengths shape is [1] (batch_size) with element type I64
+    auto input_lengths_param = std::make_shared<ov::op::v0::Parameter>(
+        input_lengths_node->get_output_element_type(0),
+        input_lengths_node->get_output_partial_shape(0));
+    input_lengths_param->set_friendly_name("input_lengths");
+    input_lengths_param->output(0).get_tensor().set_names({"input_lengths"});
+
+    // Replace the main Broadcast output with the Parameter
+    input_lengths_node->output(0).replace(input_lengths_param->output(0));
+
+    // Connect ALL LSTMSequence sequence_lengths (port 3) directly to the Parameter.
+    // Some LSTMs receive it through TopK (sort for pack_padded_sequence), others
+    // through a separate ShapeOf chain — but the NPU compiler requires the source
+    // to be exactly a Parameter or Constant, not an intermediate op.
+    for (const auto& op : model->get_ops()) {
+        if (std::string(op->get_type_info().name) != "LSTMSequence")
+            continue;
+
+        auto source = op->input_value(3).get_node_shared_ptr();
+        if (source.get() != input_lengths_param.get()) {
+            LOG_DEBUG("Redirecting LSTM '" << op->get_friendly_name()
+                                          << "' sequence_lengths directly to input_lengths parameter");
+            op->input(3).replace_source_output(input_lengths_param->output(0));
+        }
+    }
+
+    model->add_parameters({input_lengths_param});
     model->validate_nodes_and_infer_types();
 }
 }  // namespace
@@ -159,6 +223,10 @@ std::shared_ptr<ov::Model> KokoroSplit::create_model_a(const std::shared_ptr<ov:
     // the host can provide the correct padding mask for static-shape models.
     replace_text_mask_with_parameter(model_a);
 
+    // Replace input_lengths (derived from ShapeOf(input_ids) = 512) with an explicit
+    // Parameter so LSTMs process only real tokens, not padding.
+    replace_input_lengths_with_parameter(model_a);
+
     return model_a;
 }
 
@@ -226,6 +294,31 @@ std::shared_ptr<ov::Model> ov::npuw::KokoroSplit::create_model_b(const std::shar
     // Validate nodes to propagate shapes from new parameters
     model_b->validate_nodes_and_infer_types();
     return model_b;
+}
+
+void KokoroSplit::serialize_model_a(const std::shared_ptr<ov::Model>& model_a, const std::string& output_dir) {
+    OPENVINO_ASSERT(model_a, "model_a is null, cannot serialize");
+    const auto xml_path = output_dir + "/kokoro_model_a.xml";
+    const auto bin_path = output_dir + "/kokoro_model_a.bin";
+
+    LOG_DEBUG("Kokoro Model A inputs:");
+    for (const auto& param : model_a->get_parameters()) {
+        LOG_DEBUG("  " << param->get_friendly_name() << " : " << param->get_output_element_type(0) << " "
+                       << param->get_output_partial_shape(0));
+    }
+
+    LOG_DEBUG("Serializing Kokoro Model A to " << xml_path);
+    ov::pass::Serialize serialize_pass(xml_path, bin_path);
+    serialize_pass.run_on_model(model_a);
+}
+
+void KokoroSplit::serialize_model_b(const std::shared_ptr<ov::Model>& model_b, const std::string& output_dir) {
+    OPENVINO_ASSERT(model_b, "model_b is null, cannot serialize");
+    const auto xml_path = output_dir + "/kokoro_model_b.xml";
+    const auto bin_path = output_dir + "/kokoro_model_b.bin";
+    LOG_DEBUG("Serializing Kokoro Model B to " << xml_path);
+    ov::pass::Serialize serialize_pass(xml_path, bin_path);
+    serialize_pass.run_on_model(model_b);
 }
 
 }  // namespace ov::npuw

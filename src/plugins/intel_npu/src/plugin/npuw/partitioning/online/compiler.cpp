@@ -180,6 +180,7 @@ class Compiler {
         LOG_INFO("Online partitioning: compiling fixed pipeline...");
         LOG_BLOCK();
 
+        m_snapshot->earlyAvoids();
         m_snapshot->repeat([&] {
             m_snapshot->collectLHF();
         });
