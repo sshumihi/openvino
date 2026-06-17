@@ -67,6 +67,12 @@ public:
     std::vector<Transform> get_transformations() const;
     void detach();
 
+    // If this tensor is a single un-transformed Const (no Unpack/Permute/Convert/etc.),
+    // returns {original_data_ptr, byte_size}; otherwise {nullptr, 0}. The pointer is the
+    // model's weights-tensor location (XPU raw shared buffer). Used to bind such closures
+    // directly to the raw buffer (zero-copy) rather than copying into the persistent buffer.
+    std::pair<const void*, std::size_t> const_source() const;
+
     struct Meta {
         ov::Shape shape;
         ov::element::Type type;
@@ -97,6 +103,14 @@ public:
     std::size_t hash() const;
     bool operator==(const Const& other) const;
     ov::Tensor eval() const;
+    // Original constant data pointer (== the model's weights-tensor location, i.e. the
+    // XPU raw shared buffer + bin offset). Survives detach() since only m_node is reset.
+    // Used by the XPU weight-sharing path to point closures at the raw buffer (zero-copy)
+    // instead of copying them into the persistent buffer.
+    const void* source_ptr() const { return m_cached_ptr; }
+    const ov::element::Type& source_type() const { return m_cached_type; }
+    const ov::Shape& source_shape() const { return m_cached_shape; }
+    std::size_t source_byte_size() const { return m_byte_size; }
     LazyTensor::Meta eval_meta() const;
     void read_weight(const ov::npuw::s11n::WeightsContext& ctx);
     void detach();

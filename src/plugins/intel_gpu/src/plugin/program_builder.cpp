@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#include <iostream>
 #include "intel_gpu/runtime/internal_properties.hpp"
 #include "openvino/core/rt_info/weightless_caching_attributes.hpp"
 #include "openvino/op/constant.hpp"
@@ -110,6 +111,13 @@ ProgramBuilder::ProgramBuilder(std::shared_ptr<ov::Model> model, cldnn::engine& 
     CustomLayer::LoadFromFile(custom_layers_config, m_custom_layers, custom_layers_config.empty());
 
     auto ops = model->get_ordered_ops();
+
+    // XPU shared weight buffer: detect shared buffer range from model rt_info.
+    // When constants' data pointers still fall within this range (pre-transformation),
+    // the GPU can wrap them via share_usm() for zero-copy.
+    if (m_model && m_model->has_rt_info("xpu_shared_weight_ranges")) {
+        set_shared_weight_ranges(m_model->get_rt_info<std::string>("xpu_shared_weight_ranges"));
+    }
 
     GPU_DEBUG_LOG << "Build model name: " << m_model->get_name() << " friendly name: " << m_model->get_friendly_name() << std::endl;
     m_program = build(ops, is_inner_program);
@@ -357,6 +365,37 @@ void validate_inputs_count(const std::shared_ptr<ov::Node>& op, std::vector<size
     OPENVINO_THROW("Invalid inputs count (", op->get_input_size(), ") in ",
                    op->get_friendly_name(), " (", op->get_type_name(),
                    " ", op->get_type_info().version_id, ")");
+}
+
+void ProgramBuilder::set_shared_weight_ranges(const std::string& serialized) {
+    // Parse "ptr:size;ptr:size;...". Each entry is one per-weight USM buffer (<= 2GB).
+    m_shared_weight_ranges.clear();
+    std::size_t pos = 0;
+    while (pos < serialized.size()) {
+        auto semi = serialized.find(';', pos);
+        auto entry = serialized.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
+        auto colon = entry.find(':');
+        if (colon != std::string::npos) {
+            auto ptr = static_cast<const char*>(reinterpret_cast<void*>(std::stoull(entry.substr(0, colon))));
+            auto size = static_cast<std::size_t>(std::stoull(entry.substr(colon + 1)));
+            m_shared_weight_ranges.emplace_back(ptr, size);
+        }
+        if (semi == std::string::npos)
+            break;
+        pos = semi + 1;
+    }
+}
+
+bool ProgramBuilder::is_shared_weight_ptr(const void* ptr, size_t byte_count) const {
+    // A constant is zero-copyable iff its [ptr, ptr+byte_count) lies fully inside one of the
+    // registered per-weight buffers. Each buffer is <= 2GB, so the GPU can address it (a single
+    // host-USM allocation >2GB is not reliably GPU-addressable — the reason we split per weight).
+    auto p = static_cast<const char*>(ptr);
+    for (const auto& [start, size] : m_shared_weight_ranges) {
+        if (p >= start && (p + byte_count) <= (start + size))
+            return true;
+    }
+    return false;
 }
 
 }  // namespace ov::intel_gpu

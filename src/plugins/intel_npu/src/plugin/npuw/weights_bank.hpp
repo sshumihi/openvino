@@ -48,6 +48,19 @@ public:
 
     std::string get_name() const;
 
+    // XPU shared buffer support: after evaluate_and_allocate(), consolidate
+    // transformed weights into the XPU shared buffer region [alloc_offset, size).
+    void set_xpu_shared_buffer(void* ptr, size_t size, size_t alloc_offset);
+    void consolidate_to_xpu_buffer();
+    size_t get_total_tensor_bytes() const;
+
+    // XPU raw weight buffers (the per-weight GPU-shared buffers). Plain un-transformed
+    // Const closures whose source pointer lies in any of these ranges are byte-identical
+    // to a shared buffer, so they are pointed AT it (zero-copy) instead of being copied
+    // into the persistent buffer — giving GPU and NPU one physical copy. The argument is
+    // the serialized "ptr:size;ptr:size;..." range list.
+    void set_xpu_raw_ranges(const std::string& serialized);
+
 private:
     friend class ov::npuw::LLMCompiledModel;
     friend class ov::npuw::CompiledModel;
@@ -77,6 +90,18 @@ private:
     std::string m_alloc_device;
     int64_t uid_count = 0;
     std::string m_bank_name;
+
+    // XPU shared buffer for weight consolidation
+    void* m_xpu_shared_ptr = nullptr;
+    size_t m_xpu_shared_size = 0;
+    size_t m_xpu_alloc_offset = 0;
+
+    // XPU raw weight buffers (shared with the GPU side) for zero-copy Const closures.
+    std::vector<std::pair<const void*, size_t>> m_xpu_raw_ranges;
+
+    // Returns the raw-buffer pointer for a closure that is a plain Const resident in
+    // the raw buffer, or nullptr if it must be copied into the persistent buffer.
+    void* raw_resident_ptr(const StoredTensor& stored) const;
 };
 
 std::shared_ptr<Bank> bank(const std::string& bank_name,

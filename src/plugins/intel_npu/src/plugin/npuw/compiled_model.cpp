@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 #include "compiled_model.hpp"
+#include "xpu_debug.hpp"
 
 #include <algorithm>
 #include <cstring>
 #include <memory>
 #include <set>
 #include <string>
+#include <unordered_map>
 
 #include "accuracy/comparator.hpp"
 #include "attn/attn_subgraph.hpp"
@@ -45,7 +47,34 @@
 #include "openvino/util/file_util.hpp"
 #include "transformations/convert_precision.hpp"
 
+#ifdef _WIN32
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+//
+#    include <psapi.h>
+#endif
+
 namespace {
+inline double cm_committed_mb() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+        return static_cast<double>(pmc.PrivateUsage) / 1048576.0;
+#endif
+    return 0.0;
+}
+#define CM_MEM(tag)                                                                                 \
+    do {                                                                                            \
+        if (std::getenv("XPU_MEM_DEBUG"))                                                           \
+            std::cerr << "[CM][MEM] " << (tag) << ": " << cm_committed_mb() << " MB" << std::endl;  \
+    } while (0)
+
 std::string canonical_device_name(const std::string& device_name) {
     const auto dot_pos = device_name.find('.');
     return dot_pos == std::string::npos ? device_name : device_name.substr(0, dot_pos);
@@ -302,6 +331,23 @@ std::shared_ptr<ov::npuw::ICompiledModel> ov::npuw::ICompiledModel::create(
     auto config = properties;
     config.erase(ov::cache_dir.name());
 
+    // Diagnostic: trace LLM key detection
+    ::ov::npuw::xpu_dbg() << "[NPUW create] use_llm_key=\"" << use_llm_key
+              << "\" count=" << properties.count(use_llm_key);
+    if (properties.count(use_llm_key)) {
+        try {
+            ::ov::npuw::xpu_dbg() << " as_bool=" << properties.at(use_llm_key).as<bool>();
+        } catch (...) {
+            ::ov::npuw::xpu_dbg() << " as_bool=FAILED";
+        }
+        try {
+            ::ov::npuw::xpu_dbg() << " as_string=\"" << properties.at(use_llm_key).as<std::string>() << "\"";
+        } catch (...) {
+            ::ov::npuw::xpu_dbg() << " as_string=FAILED";
+        }
+    }
+    ::ov::npuw::xpu_dbg() << std::endl;
+
     if (properties.count(use_llm_key) && properties.at(use_llm_key).as<bool>() == true) {
         LOG_INFO("ov::npuw::LLMCompiledModel will be created.");
         compiled_model = std::make_shared<ov::npuw::LLMCompiledModel>(model, plugin, config);
@@ -346,6 +392,14 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     std::map<std::string, ov::Any> npuw_props;
     split_properties(properties, m_non_npuw_props, npuw_props);
 
+    // Diagnostic: trace DCOFF config propagation
+    {
+        auto it = npuw_props.find("NPUW_DCOFF_TYPE");
+        ::ov::npuw::xpu_dbg() << "[NPUW CompiledModel] npuw_props NPUW_DCOFF_TYPE="
+                  << (it != npuw_props.end() ? it->second.as<std::string>() : "(NOT FOUND)")
+                  << " model=" << model->get_friendly_name() << std::endl;
+    }
+
     m_cfg.parseEnvVars();
     m_cfg.update(any_copy(npuw_props));
 
@@ -366,6 +420,19 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     const std::string weights_bank_opt = m_cfg.get<::intel_npu::NPUW_WEIGHTS_BANK>();
     const std::string wbank_alloc = m_cfg.get<::intel_npu::NPUW_WEIGHTS_BANK_ALLOC>();
     m_weights_bank = ov::npuw::weights::bank(weights_bank_opt, plugin->get_core(), wbank_alloc);
+
+    // Wire XPU shared buffer to Bank for weight consolidation
+    {
+        auto xpu_ptr_it = properties.find("XPU_SHARED_WEIGHT_PTR");
+        auto xpu_size_it = properties.find("XPU_SHARED_WEIGHT_SIZE");
+        auto xpu_off_it = properties.find("XPU_SHARED_WEIGHT_ALLOC_OFFSET");
+        if (xpu_ptr_it != properties.end() && xpu_size_it != properties.end()) {
+            auto ptr = reinterpret_cast<void*>(xpu_ptr_it->second.as<uint64_t>());
+            auto size = xpu_size_it->second.as<uint64_t>();
+            auto offset = xpu_off_it != properties.end() ? xpu_off_it->second.as<uint64_t>() : size;
+            m_weights_bank->set_xpu_shared_buffer(ptr, static_cast<size_t>(size), static_cast<size_t>(offset));
+        }
+    }
 
     LOG_VERB("*** Original model ***");
     const auto& orig_parameters = model->get_parameters();
@@ -409,9 +476,11 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     ctx.subgraph_patterns = &combined_subgraph_patterns.value();
 
     ov::npuw::Partitioning partitioning;
+    CM_MEM("before getPartitioning");
     m_profile["partitioning"].record([&]() {
         partitioning = getPartitioning(model, m_cfg, ctx);
     });
+    CM_MEM("after getPartitioning");
 
     m_total_stat.gflops = partitioning.total_gflops;
     m_total_stat.ops = partitioning.total_ops;
@@ -726,9 +795,11 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     } else {
         ov::npuw::util::non_parallel_for(idx_subgraph_to_compile.size(), compile);
     }
+    CM_MEM("after submodel VCL compiles");
 
     // Finalize memory in closures and weight banks
     finalize_weights_bank();
+    CM_MEM("after finalize_weights_bank");
     detach_memory();
 
     // Print stats report when possible
@@ -981,6 +1052,16 @@ void ov::npuw::CompiledModel::CompiledModelDesc::serialize(ov::npuw::s11n::Strea
 }
 
 ov::npuw::CompiledModel::~CompiledModel() {
+    if (m_eval_future.valid()) {
+        m_eval_future.wait();
+    }
+}
+
+void ov::npuw::ICompiledModel_v0::wait_for_weights_evaluation() {
+    // Default: no-op. CompiledModel overrides with m_eval_future.
+}
+
+void ov::npuw::CompiledModel::wait_for_weights_evaluation() {
     if (m_eval_future.valid()) {
         m_eval_future.wait();
     }
@@ -1357,6 +1438,198 @@ void ov::npuw::CompiledModel::reconstruct_closure() {
     }
 }
 
+std::pair<size_t,size_t> ov::npuw::CompiledModel::refresh_bank_closures() {
+    size_t total_refreshed = 0;
+    size_t total_in_buffer = 0;
+    auto* buf_start = static_cast<uint8_t*>(m_weights_bank->m_xpu_shared_ptr);
+    auto  buf_size  = m_weights_bank->m_xpu_shared_size;
+
+    for (size_t idx = 0; idx < m_compiled_submodels.size(); ++idx) {
+        auto& comp_model_desc = m_compiled_submodels[idx];
+        if (!comp_model_desc.compiled_model && !comp_model_desc.replaced_by)
+            continue;
+        const auto real_idx = comp_model_desc.replaced_by.value_or(idx);
+        auto& desc_closure = comp_model_desc.closure.get();
+        for (std::size_t cidx = 0; cidx < desc_closure.closure.size(); ++cidx) {
+            if (desc_closure.closure_uid[cidx] >= 0) {
+                desc_closure.closure[cidx] =
+                    m_weights_bank->get(desc_closure.closure_uid[cidx], submodel_device(real_idx));
+                total_refreshed++;
+                if (buf_start && desc_closure.closure[cidx]) {
+                    auto* p = static_cast<uint8_t*>(desc_closure.closure[cidx].data());
+                    if (p >= buf_start && p < buf_start + buf_size) {
+                        total_in_buffer++;
+                    }
+                }
+            }
+        }
+    }
+    LOG_INFO("[DIAG] refresh_bank_closures: refreshed " << total_refreshed
+             << " closures, " << total_in_buffer << " point into shared buffer ["
+             << (void*)buf_start << ", " << (void*)(buf_start + buf_size) << ")");
+    return {total_refreshed, total_in_buffer};
+}
+
+std::size_t ov::npuw::CompiledModel::host_closure_bytes(std::set<const void*>& seen) const {
+    // Sum byte sizes of unique host-side closures (closure_uid < 0). Dedup by the
+    // tensor's data pointer so a closure shared across submodels/models counts once.
+    // Closures whose data already lies in a GPU-shared per-weight USM buffer are EXCLUDED:
+    // they are zero-copy aliases and must not be copied into the persistent buffer (else the
+    // same bytes would be stored twice). Must match the skip in consolidate_host_closures().
+    const auto& raw_ranges = m_weights_bank ? m_weights_bank->m_xpu_raw_ranges
+                                            : std::vector<std::pair<const void*, std::size_t>>{};
+    auto raw_resident = [&](const void* p, std::size_t sz) {
+        auto* q = static_cast<const std::uint8_t*>(p);
+        for (const auto& [rp, rsize] : raw_ranges) {
+            auto* r = static_cast<const std::uint8_t*>(rp);
+            if (q >= r && q + sz <= r + rsize)
+                return true;
+        }
+        return false;
+    };
+    std::size_t total = 0;
+    for (size_t idx = 0; idx < m_compiled_submodels.size(); ++idx) {
+        const auto& comp_model_desc = m_compiled_submodels[idx];
+        if (!comp_model_desc.compiled_model && !comp_model_desc.replaced_by)
+            continue;
+        const auto& desc_closure = comp_model_desc.closure.get();
+        for (std::size_t cidx = 0; cidx < desc_closure.closure.size(); ++cidx) {
+            if (desc_closure.closure_uid[cidx] >= 0)
+                continue;  // Bank-managed, handled by consolidate_to_xpu_buffer
+            const auto& t = desc_closure.closure[cidx];
+            if (!t)
+                continue;
+            const void* p = t.data();
+            if (!seen.insert(p).second)
+                continue;  // already counted
+            // A plain-Const closure whose source lies in a per-weight USM buffer will be pointed
+            // there (zero-copy) instead of copied -> exclude it from persistent sizing. The source
+            // ptr comes from the LazyTensor (const_source()), NOT t.data() (an evaluated heap copy).
+            auto cs = cidx < comp_model_desc.lazy_closure.size()
+                          ? comp_model_desc.lazy_closure[cidx].const_source()
+                          : std::pair<const void*, std::size_t>{nullptr, 0};
+            if (cs.first && raw_resident(cs.first, t.get_byte_size()))
+                continue;
+            total += t.get_byte_size();
+        }
+    }
+    return total;
+}
+
+std::size_t ov::npuw::CompiledModel::consolidate_host_closures(std::uint8_t* buf,
+                                                               std::size_t buf_size,
+                                                               std::size_t offset,
+                                                               std::map<const void*, void*>& relocated) {
+    // Relocate host-side closures (closure_uid < 0) into the shared buffer at
+    // [buf+offset, ...), deduplicating by source data pointer via `relocated`, and
+    // rebind the closure tensor to the shared-buffer copy.
+    auto* buf_end = buf + buf_size;
+    // A closure whose data already lies in a GPU-shared per-weight USM buffer is a zero-copy
+    // alias — leave it pointing there instead of copying into persistent (one physical copy,
+    // shared by GPU and NPU). Must match the exclusion in host_closure_bytes().
+    const auto& raw_ranges = m_weights_bank ? m_weights_bank->m_xpu_raw_ranges
+                                            : std::vector<std::pair<const void*, std::size_t>>{};
+    auto raw_resident = [&](const void* p, std::size_t sz) {
+        auto* q = static_cast<const std::uint8_t*>(p);
+        for (const auto& [rp, rsize] : raw_ranges) {
+            auto* r = static_cast<const std::uint8_t*>(rp);
+            if (q >= r && q + sz <= r + rsize)
+                return true;
+        }
+        return false;
+    };
+    std::size_t raw_host = 0, raw_host_bytes = 0;
+    for (size_t idx = 0; idx < m_compiled_submodels.size(); ++idx) {
+        auto& comp_model_desc = m_compiled_submodels[idx];
+        if (!comp_model_desc.compiled_model && !comp_model_desc.replaced_by)
+            continue;
+        auto& desc_closure = comp_model_desc.closure.get();
+        for (std::size_t cidx = 0; cidx < desc_closure.closure.size(); ++cidx) {
+            if (desc_closure.closure_uid[cidx] >= 0)
+                continue;
+            auto& t = desc_closure.closure[cidx];
+            if (!t)
+                continue;
+            auto* src = static_cast<uint8_t*>(t.data());
+            // Already inside the shared buffer — nothing to do.
+            if (src >= buf && src < buf_end)
+                continue;
+            const std::size_t sz = t.get_byte_size();
+            // If this is a plain-Const closure whose source lies in a GPU-shared per-weight
+            // buffer, point it THERE (zero-copy) instead of copying into persistent. The source
+            // ptr comes from the LazyTensor (const_source()); t.data() is an evaluated heap copy
+            // that is NOT in the shared buffer, so it must be redirected, not just left alone.
+            auto cs = cidx < comp_model_desc.lazy_closure.size()
+                          ? comp_model_desc.lazy_closure[cidx].const_source()
+                          : std::pair<const void*, std::size_t>{nullptr, 0};
+            if (cs.first && raw_resident(cs.first, sz)) {
+                t = ov::Tensor(t.get_element_type(), t.get_shape(), const_cast<void*>(cs.first));
+                desc_closure.is_remote[cidx] = false;
+                ++raw_host;
+                raw_host_bytes += sz;
+                continue;
+            }
+            auto it = relocated.find(src);
+            if (it != relocated.end()) {
+                // Same source already relocated — rebind to the existing copy.
+                t = ov::Tensor(t.get_element_type(), t.get_shape(), it->second);
+                desc_closure.is_remote[cidx] = false;
+                continue;
+            }
+            NPUW_ASSERT(offset + sz <= buf_size &&
+                        "XPU shared buffer overflow during host-closure consolidation");
+            std::memcpy(buf + offset, src, sz);
+            void* dst = buf + offset;
+            relocated.emplace(src, dst);
+            t = ov::Tensor(t.get_element_type(), t.get_shape(), dst);
+            desc_closure.is_remote[cidx] = false;
+            offset += sz;
+        }
+    }
+    if (raw_host > 0) {
+        ::ov::npuw::xpu_dbg() << "[DIAG] host-closure raw-share: " << raw_host << " host closures ("
+                  << raw_host_bytes << " bytes) kept zero-copy in per-weight buffers (not copied)"
+                  << std::endl;
+    }
+    return offset;
+}
+
+std::pair<std::size_t, std::size_t> ov::npuw::CompiledModel::count_closures_in_buffer(
+    const std::uint8_t* buf,
+    std::size_t size) const {
+    std::size_t in_buffer = 0, total = 0;
+    const auto* buf_end = buf + size;
+    // Closures may live in the persistent buffer [buf, buf_end) OR, for zero-copy
+    // raw-resident Const closures, in any of the GPU-shared per-weight buffers.
+    // Count both as "in buffer".
+    const auto& raw_ranges = m_weights_bank ? m_weights_bank->m_xpu_raw_ranges
+                                            : std::vector<std::pair<const void*, std::size_t>>{};
+    auto in_raw = [&](const std::uint8_t* p) {
+        for (const auto& [rp, rsize] : raw_ranges) {
+            auto* r = static_cast<const std::uint8_t*>(rp);
+            if (p >= r && p < r + rsize)
+                return true;
+        }
+        return false;
+    };
+    for (size_t idx = 0; idx < m_compiled_submodels.size(); ++idx) {
+        const auto& comp_model_desc = m_compiled_submodels[idx];
+        if (!comp_model_desc.compiled_model && !comp_model_desc.replaced_by)
+            continue;
+        const auto& desc_closure = comp_model_desc.closure.get();
+        for (std::size_t cidx = 0; cidx < desc_closure.closure.size(); ++cidx) {
+            const auto& t = desc_closure.closure[cidx];
+            if (!t)
+                continue;
+            total++;
+            const auto* p = static_cast<const std::uint8_t*>(t.data());
+            if ((p >= buf && p < buf_end) || in_raw(p))
+                in_buffer++;
+        }
+    }
+    return {in_buffer, total};
+}
+
 std::size_t ov::npuw::CompiledModel::num_submodels() const {
     return m_compiled_submodels.size();
 }
@@ -1427,6 +1700,24 @@ void ov::npuw::CompiledModel::finalize_weights_bank() {
                 // FIXME: find a more reliable way to do so
                 desc_closure.is_remote[tidx] = m_weights_bank->is_remote(uid);
             }
+        }
+
+        // Diagnostic: log host-side vs Bank-managed closure counts per submodel
+        for (size_t idx = 0; idx < m_compiled_submodels.size(); ++idx) {
+            auto& comp_model_desc = m_compiled_submodels[idx];
+            if (!comp_model_desc.compiled_model && !comp_model_desc.replaced_by) {
+                continue;
+            }
+            auto& desc_closure = comp_model_desc.closure.unsafe_get();
+            size_t host_count = 0, bank_count = 0;
+            for (std::size_t tidx = 0; tidx < desc_closure.closure.size(); ++tidx) {
+                if (desc_closure.closure_uid[tidx] >= 0)
+                    bank_count++;
+                else
+                    host_count++;
+            }
+            ::ov::npuw::xpu_dbg() << "[DIAG] Submodel " << idx << ": " << bank_count << " Bank closures, "
+                      << host_count << " host closures (total=" << desc_closure.closure.size() << ")" << std::endl;
         }
 
         m_import_weights_ctx.reset();
@@ -1888,6 +2179,40 @@ ov::SoPtr<ov::ICompiledModel> ov::npuw::CompiledModel::compile_submodel(const st
             device_config.insert(ov::internal::exclusive_async_requests(true));
         }
     }  // if(subgraphs > 1)
+
+    // Fix for VCL NPU compiler's StopLocationVerifierPass which requires unique
+    // MLIR operation names. Assign sequential names to all nodes before compilation.
+    if (ov::npuw::util::starts_with(device, "NPU")) {
+        size_t idx = 0;
+        for (auto& node : submodel->get_ordered_ops()) {
+            node->set_friendly_name("n" + std::to_string(idx++));
+        }
+        // Diagnostics: dump parameter shapes/types and full op graph for VCL debugging
+        ::ov::npuw::xpu_dbg() << "[NPUW compile_submodel] " << submodel->get_friendly_name()
+                  << " params=" << submodel->get_parameters().size()
+                  << " ops=" << submodel->get_ordered_ops().size() << std::endl;
+        for (size_t i = 0; i < submodel->get_parameters().size(); i++) {
+            auto& p = submodel->get_parameters()[i];
+            ::ov::npuw::xpu_dbg() << "  param[" << i << "] " << p->get_element_type()
+                      << " " << p->get_partial_shape() << std::endl;
+        }
+        // Dump all ops in the sub-model to understand the graph structure
+        if (submodel->get_friendly_name().find("REP") != std::string::npos) {
+            ::ov::npuw::xpu_dbg() << "  === Op graph ===" << std::endl;
+            for (auto& node : submodel->get_ordered_ops()) {
+                ::ov::npuw::xpu_dbg() << "  " << node->get_type_info().name
+                          << " \"" << node->get_friendly_name() << "\"";
+                for (size_t j = 0; j < node->get_input_size(); j++) {
+                    auto src = node->input(j).get_source_output();
+                    ::ov::npuw::xpu_dbg() << " in" << j << "=" << src.get_node()->get_friendly_name()
+                              << "[" << src.get_element_type() << " " << src.get_partial_shape() << "]";
+                }
+                ::ov::npuw::xpu_dbg() << " -> " << node->get_output_element_type(0)
+                          << " " << node->get_output_partial_shape(0) << std::endl;
+            }
+        }
+    }
+
     return core->compile_model(submodel, device, device_config);
 }
 

@@ -4,6 +4,8 @@
 
 #include "llm_infer_request.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <regex>
 
 #include "infer_request_utils.hpp"
@@ -232,6 +234,9 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
 
     m_llm_profile.report_on_die = ov::npuw::profiling_enabled();
     m_llm_profile.area = "LLM/execution";
+
+    // The XPU plugin's external-prefill signal (GPU prefill → NPU decode) is consumed lazily at the top
+    // of infer() per conversation; the request is created once and reused, so nothing to consume here.
 }
 
 std::string ov::npuw::LLMInferRequest::init_pre_alloc_device() {
@@ -295,6 +300,43 @@ void ov::npuw::LLMInferRequest::create_generate_request_variants(
         const auto& input_name = input_port.get_any_name();
         if (ov::npuw::util::starts_with(input_name, layer_names::past_key_values)) {
             largest_past_kv_tensors[input_name] = largest_generate_request->get_tensor(input_port);
+        }
+    }
+
+    // Replace KV tensors with shared-buffer-backed ones if XPU shared KV cache is set
+    if (compiled_model->m_kvcache_buffer_ptr != nullptr) {
+        auto* buf = static_cast<uint8_t*>(compiled_model->m_kvcache_buffer_ptr);
+        size_t buf_size = compiled_model->m_kvcache_buffer_size;
+        size_t offset = 0;
+
+        // Sort names for deterministic layout
+        std::vector<std::string> kv_names;
+        for (const auto& [name, _] : largest_past_kv_tensors) {
+            kv_names.push_back(name);
+        }
+        std::sort(kv_names.begin(), kv_names.end());
+
+        for (const auto& name : kv_names) {
+            auto& orig = largest_past_kv_tensors[name];
+            size_t bytes = orig->get_byte_size();
+            OPENVINO_ASSERT(offset + bytes <= buf_size,
+                            "KV cache buffer overflow: offset=", offset, " bytes=", bytes,
+                            " buf_size=", buf_size);
+
+            auto shared = ov::SoPtr<ov::ITensor>(
+                ov::make_tensor(orig->get_element_type(), orig->get_shape(), buf + offset), nullptr);
+            std::memset(buf + offset, 0, bytes);
+
+            // Replace on largest request
+            for (const auto& port : largest_generate_request->get_compiled_model()->inputs()) {
+                if (port.get_any_name() == name) {
+                    largest_generate_request->set_tensor(port, shared);
+                    break;
+                }
+            }
+            // Update map so smaller variants inherit the shared buffer via data()
+            largest_past_kv_tensors[name] = shared;
+            offset += bytes;
         }
     }
 
@@ -480,6 +522,25 @@ void ov::npuw::LLMInferRequest::apply_lora() {
         }
         variableState->clear_state_updated();
     }
+}
+
+void ov::npuw::LLMInferRequest::init_from_external_prefill(int64_t prompt_length) {
+    // 1. Select variant + set up ports (same as normal prepare_for_new_conversation)
+    //    This zeros prefill tensors, selects the right generate variant, and
+    //    sets m_kvcache_request / m_kvcache_in_ports / m_kvcache_out_ports.
+    prepare_for_new_conversation(prompt_length);
+
+    // 2. Set num_stored_tokens as if prefill already ran.
+    //    KV data is already in the shared buffer from GPU prefill.
+    m_npuw_llm_compiled_model->m_kvcache_desc.num_stored_tokens =
+        static_cast<uint32_t>(prompt_length);
+
+    // 3. Mark generate as initialized — skip copy_kvcache() in infer_generate()
+    //    since KV data is already in place.
+    m_generate_initialized = true;
+
+    // 4. Mark first run done so subsequent infer() calls go to generate path.
+    m_first_run = false;
 }
 
 void ov::npuw::LLMInferRequest::prepare_for_new_conversation() {
@@ -1165,6 +1226,17 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
 }
 
 void ov::npuw::LLMInferRequest::infer() {
+    // XPU hybrid (reused request): the GPU ran prefill and wrote KV into the shared buffer. The XPU
+    // plugin signals the prompt length via the XPU_EXTERNAL_PREFILL_LEN compiled-model property before
+    // this conversation's first decode infer (instead of recreating the request). Consume it here:
+    // re-initialize for generate mode (select the variant for this prompt_len, set num_stored_tokens),
+    // then clear so it fires once per conversation. This lets the request be REUSED across
+    // conversations, avoiding the ~220 ms create_infer_request() on every prefill.
+    if (m_npuw_llm_compiled_model->m_external_prefill_len > 0) {
+        init_from_external_prefill(static_cast<int64_t>(m_npuw_llm_compiled_model->m_external_prefill_len));
+        m_npuw_llm_compiled_model->m_external_prefill_len = 0;  // consumed (one-shot per conversation)
+    }
+
     const auto& inputs = get_inputs();
 
     auto input_ids = get_tensor(ov::npuw::util::find_port_by_name(inputs, m_input_ids_name).value());

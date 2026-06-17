@@ -3,11 +3,24 @@
 //
 
 #include "weights_bank.hpp"
+#include "xpu_debug.hpp"
+
+#include <iostream>
+#include <map>
 
 #include "logging.hpp"
 #include "openvino/core/parallel.hpp"
 #include "serialization.hpp"
 #include "util.hpp"
+
+namespace {
+template <class... Ts>
+struct overloaded : Ts... {
+    using Ts::operator()...;
+};
+template <class... Ts>
+overloaded(Ts...) -> overloaded<Ts...>;
+}  // namespace
 
 using ov::npuw::weights::Bank;
 using ov::npuw::weights::LazyTensor;
@@ -110,6 +123,11 @@ void Bank::evaluate_and_allocate() {
             evaluate_and_allocate_on_device(device_bank, to_process, device_for_alloc);
         }
     }  // for (m_device_banks)
+
+    // Post-evaluation consolidation: copy transformed weights into XPU shared buffer
+    if (m_xpu_shared_ptr) {
+        consolidate_to_xpu_buffer();
+    }
 }
 
 void Bank::evaluate_cpu(Bank::DeviceBank& device_bank, const std::vector<LazyTensor>& to_process) {
@@ -121,6 +139,28 @@ void Bank::evaluate_cpu(Bank::DeviceBank& device_bank, const std::vector<LazyTen
         NPUW_ASSERT(iter_device_registered != device_bank.registered_tensors.end() &&
                     "Tensor should be registered first!");
         auto uid = iter_device_registered->second;
+
+        // XPU shared buffer: if this is a plain un-transformed Const whose source data lies fully
+        // inside a registered raw buffer (the GPU+NPU shared malloc), store a zero-copy VIEW of it
+        // instead of eval + allocate + copy. This avoids a full host MATERIALIZATION of the weights
+        // at compile time (the closure already lives in the shared buffer the NPU reads at inference).
+        if (!m_xpu_raw_ranges.empty()) {
+            auto cs = lt.const_source();  // {ptr, byte_size} for a plain Const, else {nullptr, 0}
+            if (cs.first) {
+                const auto* p = static_cast<const uint8_t*>(cs.first);
+                for (const auto& [raw, size] : m_xpu_raw_ranges) {
+                    const auto* rp = static_cast<const uint8_t*>(raw);
+                    if (p >= rp && p + cs.second <= rp + size) {
+                        auto meta = lt.eval_meta();
+                        device_bank.storage.at(uid).tensor =
+                            ov::Tensor(meta.type, meta.shape, const_cast<void*>(cs.first));
+                        const_cast<LazyTensor&>(lt).detach();
+                        return;  // zero-copy view; skip materialization
+                    }
+                }
+            }
+        }
+
         auto t = lt.eval();
         device_bank.storage.at(uid).tensor = ov::Tensor(t.get_element_type(), t.get_shape());
         // Get ownership of the weights, might be a mmaped object during import
@@ -143,14 +183,48 @@ void Bank::evaluate_and_allocate_on_device(Bank::DeviceBank& device_bank,
     // as we lock in evaluate_and_allocate() now.
     std::vector<TensorToAllocate> uids_to_allocated;
     uids_to_allocated.reserve(uid_count);
+    std::size_t raw_views = 0;
 
     for (const auto& lt : to_process) {
         auto iter_device_registered = device_bank.registered_tensors.find(lt);
         NPUW_ASSERT(iter_device_registered != device_bank.registered_tensors.end() &&
                     "Tensor should be registered first!");
         auto uid = iter_device_registered->second;
+
+        // XPU shared buffer: if this is a plain un-transformed Const whose source lies fully inside a
+        // registered raw buffer (the GPU+NPU shared malloc), store a zero-copy VIEW of it instead of
+        // allocating an NPU host tensor and copying the weight in. The NPU imports this same shared
+        // buffer at inference, so the device copy is pure duplication. (consolidate_to_xpu_buffer
+        // does the same post-eval; doing it here avoids materializing the weights at all.)
+        if (!m_xpu_raw_ranges.empty()) {
+            auto cs = lt.const_source();  // {ptr, byte_size} for a plain Const, else {nullptr, 0}
+            if (cs.first) {
+                const auto* p = static_cast<const uint8_t*>(cs.first);
+                bool resident = false;
+                for (const auto& [raw, size] : m_xpu_raw_ranges) {
+                    const auto* rp = static_cast<const uint8_t*>(raw);
+                    if (p >= rp && p + cs.second <= rp + size) {
+                        resident = true;
+                        break;
+                    }
+                }
+                if (resident) {
+                    auto meta = lt.eval_meta();
+                    device_bank.storage.at(uid).tensor =
+                        ov::Tensor(meta.type, meta.shape, const_cast<void*>(cs.first));
+                    const_cast<LazyTensor&>(lt).detach();
+                    ++raw_views;
+                    continue;  // skip device allocation + materialization
+                }
+            }
+        }
+
         uids_to_allocated.push_back({lt.eval_meta(), ov::Tensor(), uid});
     }
+    if (std::getenv("XPU_MEM_DEBUG"))
+        std::cerr << "[DIAG] eval_on_device(" << device << "): to_process=" << to_process.size()
+                  << " ranges=" << m_xpu_raw_ranges.size() << " raw_views=" << raw_views
+                  << " materialized=" << uids_to_allocated.size() << std::endl;
     // Sort by UIDs, lowest first
     std::sort(uids_to_allocated.begin(),
               uids_to_allocated.end(),
@@ -180,6 +254,180 @@ void Bank::evaluate_and_allocate_on_device(Bank::DeviceBank& device_bank,
         // Note: this is the non-CPU path!
         const_cast<LazyTensor&>(stored_tensor.lt).detach();
     });
+}
+
+void Bank::set_xpu_shared_buffer(void* ptr, size_t size, size_t alloc_offset) {
+    m_xpu_shared_ptr = ptr;
+    m_xpu_shared_size = size;
+    m_xpu_alloc_offset = alloc_offset;
+    LOG_INFO("XPU shared buffer set: ptr=" << ptr << " size=" << size << " alloc_offset=" << alloc_offset);
+}
+
+void Bank::set_xpu_raw_ranges(const std::string& serialized) {
+    // Parse "ptr:size;ptr:size;..." — one entry per GPU-shared per-weight buffer.
+    m_xpu_raw_ranges.clear();
+    std::size_t pos = 0;
+    while (pos < serialized.size()) {
+        auto semi = serialized.find(';', pos);
+        auto entry = serialized.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
+        auto colon = entry.find(':');
+        if (colon != std::string::npos) {
+            auto ptr = reinterpret_cast<const void*>(std::stoull(entry.substr(0, colon)));
+            auto size = static_cast<std::size_t>(std::stoull(entry.substr(colon + 1)));
+            m_xpu_raw_ranges.emplace_back(ptr, size);
+        }
+        if (semi == std::string::npos)
+            break;
+        pos = semi + 1;
+    }
+    LOG_INFO("XPU raw ranges set: " << m_xpu_raw_ranges.size() << " buffers");
+}
+
+void* Bank::raw_resident_ptr(const StoredTensor& stored) const {
+    // Only when raw buffers are registered and the closure is a plain un-transformed
+    // Const whose original data pointer + size lies entirely within one of them.
+    if (m_xpu_raw_ranges.empty() || !stored.tensor) {
+        return nullptr;
+    }
+    auto src = stored.lt.const_source();  // {ptr, byte_size}
+    if (!src.first) {
+        return nullptr;
+    }
+    // The evaluated tensor's bytes must match the const source (no element-type change).
+    if (src.second != stored.tensor.get_byte_size()) {
+        return nullptr;
+    }
+    auto* p = static_cast<const uint8_t*>(src.first);
+    for (const auto& [raw, size] : m_xpu_raw_ranges) {
+        auto* rp = static_cast<const uint8_t*>(raw);
+        if (p >= rp && p + src.second <= rp + size) {
+            return const_cast<void*>(src.first);
+        }
+    }
+    return nullptr;
+}
+
+void Bank::consolidate_to_xpu_buffer() {
+    // Note: when called from evaluate_and_allocate(), m_mutex is already held.
+    // When called from LLMCompiledModel::set_property() (deferred path),
+    // evaluations are complete and no concurrent access occurs.
+    auto* buf = static_cast<uint8_t*>(m_xpu_shared_ptr);
+    auto* buf_end = buf + m_xpu_shared_size;
+    size_t offset = m_xpu_alloc_offset;
+    size_t relocated_count = 0;
+    size_t relocated_bytes = 0;
+    size_t skipped_count = 0;
+    size_t raw_shared_count = 0;
+    size_t raw_shared_bytes = 0;
+
+    // Per-type statistics: element_type_name -> {count, total_bytes}
+    std::map<std::string, std::pair<size_t, size_t>> type_stats;
+    // Per-transform statistics: transform_name -> {count, total_bytes}
+    std::map<std::string, std::pair<size_t, size_t>> transform_stats;
+
+    for (auto& [device, device_bank] : m_device_banks) {
+        ::ov::npuw::xpu_dbg() << "[DIAG] consolidate_to_xpu_buffer: device=" << device
+                  << " storage_size=" << device_bank.storage.size() << std::endl;
+        for (auto& [uid, stored] : device_bank.storage) {
+            if (!stored.tensor) {
+                continue;
+            }
+
+            auto* tensor_data = static_cast<uint8_t*>(stored.tensor.data());
+            size_t tensor_size = stored.tensor.get_byte_size();
+
+            // Determine LazyTensor transform type
+            std::string transform_name = "none";
+            auto transforms = stored.lt.get_transformations();
+            if (!transforms.empty()) {
+                std::visit(overloaded{
+                    [&](const ov::npuw::weights::op::Const&)   { transform_name = "Const"; },
+                    [&](const ov::npuw::weights::op::Unpack&)  { transform_name = "Unpack"; },
+                    [&](const ov::npuw::weights::op::Permute&) { transform_name = "Permute"; },
+                    [&](const ov::npuw::weights::op::Convert&) { transform_name = "Convert"; },
+                    [&](const ov::npuw::weights::op::Concat&)  { transform_name = "Concat"; },
+                    [&](const ov::npuw::weights::op::Gather&)  { transform_name = "Gather"; },
+                }, transforms[0]);
+                if (transforms.size() > 1) {
+                    transform_name += "+" + std::to_string(transforms.size() - 1) + "more";
+                }
+            }
+
+            auto type_name = stored.tensor.get_element_type().get_type_name();
+            type_stats[type_name].first++;
+            type_stats[type_name].second += tensor_size;
+            transform_stats[transform_name].first++;
+            transform_stats[transform_name].second += tensor_size;
+
+            ::ov::npuw::xpu_dbg() << "[DIAG]   [uid=" << uid << "] transform=" << transform_name
+                      << " type=" << stored.tensor.get_element_type()
+                      << " shape=" << stored.tensor.get_shape()
+                      << " bytes=" << tensor_size << std::endl;
+
+            // Skip tensors already in the shared buffer range
+            if (tensor_data >= buf && tensor_data + tensor_size <= buf_end) {
+                skipped_count++;
+                continue;
+            }
+
+            // Zero-copy raw-buffer sharing: a plain Const closure that is byte-identical
+            // to the GPU-shared raw buffer is pointed AT the raw buffer instead of being
+            // copied into the persistent buffer, so GPU and NPU hold one physical copy.
+            if (void* raw_ptr = raw_resident_ptr(stored)) {
+                stored.tensor = ov::Tensor(stored.tensor.get_element_type(), stored.tensor.get_shape(), raw_ptr);
+                raw_shared_count++;
+                raw_shared_bytes += tensor_size;
+                continue;
+            }
+
+            // Buffer must be exactly sized — overflow is a bug
+            NPUW_ASSERT(offset + tensor_size <= m_xpu_shared_size &&
+                        "XPU shared buffer overflow: buffer was not sized correctly");
+
+            // Copy tensor data to shared buffer and replace the tensor
+            std::memcpy(buf + offset, tensor_data, tensor_size);
+            stored.tensor = ov::Tensor(stored.tensor.get_element_type(), stored.tensor.get_shape(), buf + offset);
+            relocated_count++;
+            relocated_bytes += tensor_size;
+            offset += tensor_size;
+        }
+    }
+
+    ::ov::npuw::xpu_dbg() << "[DIAG] consolidate_to_xpu_buffer: relocated " << relocated_count << " tensors (" << relocated_bytes
+              << " bytes), skipped " << skipped_count
+              << ", raw-shared " << raw_shared_count << " tensors (" << raw_shared_bytes
+              << " bytes, zero-copy from GPU raw buffer)"
+              << ", final offset=" << offset << "/" << m_xpu_shared_size << std::endl;
+
+    ::ov::npuw::xpu_dbg() << "[DIAG] === Summary by element type ===" << std::endl;
+    for (const auto& [type, stats] : type_stats) {
+        ::ov::npuw::xpu_dbg() << "[DIAG]   " << type << ": " << stats.first << " tensors, "
+                  << (stats.second / 1048576.0) << " MB" << std::endl;
+    }
+    ::ov::npuw::xpu_dbg() << "[DIAG] === Summary by transform type ===" << std::endl;
+    for (const auto& [tform, stats] : transform_stats) {
+        ::ov::npuw::xpu_dbg() << "[DIAG]   " << tform << ": " << stats.first << " tensors, "
+                  << (stats.second / 1048576.0) << " MB" << std::endl;
+    }
+}
+
+size_t Bank::get_total_tensor_bytes() const {
+    std::unique_lock guard(m_mutex);
+    size_t total = 0;
+    for (const auto& [device, device_bank] : m_device_banks) {
+        for (const auto& [uid, stored] : device_bank.storage) {
+            if (stored.tensor) {
+                // Raw-resident Const closures are not copied into the persistent buffer
+                // (they are pointed at the shared raw buffer), so exclude them from the
+                // persistent-buffer sizing.
+                if (raw_resident_ptr(stored)) {
+                    continue;
+                }
+                total += stored.tensor.get_byte_size();
+            }
+        }
+    }
+    return total;
 }
 
 bool Bank::is_remote(int64_t uid) const {

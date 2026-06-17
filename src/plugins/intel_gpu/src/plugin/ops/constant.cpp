@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#include <cstdlib>
+#include <iostream>
+
 #include "intel_gpu/plugin/program_builder.hpp"
 #include "intel_gpu/plugin/common_utils.hpp"
 #include "intel_gpu/op/convolution.hpp"
 
 #include "openvino/core/weight_sharing_util.hpp"
+#include "openvino/core/rt_info/weightless_caching_attributes.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/convolution.hpp"
 #include "openvino/op/convert.hpp"
@@ -100,6 +104,45 @@ static void create_data(ProgramBuilder& p, const ov::Shape& const_shape, const s
         p.primitive_ids[initialconstPrimID] = constPrimID;
         p.profiling_ids.push_back(initialconstPrimID);
     } else {
+        // Check if data type conversion is needed (precludes zero-copy sharing)
+        bool needs_conversion = false;
+        if (ov::shape_size(const_shape) == 1 &&
+            out_dtype == cldnn::data_types::f32 &&
+            op->get_output_element_type(0) == ov::element::f64) {
+            needs_conversion = true;
+        } else if (out_dtype == cldnn::data_types::f32 &&
+                   (op->get_output_element_type(0) == ov::element::u16 ||
+                    op->get_output_element_type(0) == ov::element::i16)) {
+            needs_conversion = true;
+        }
+
+        // XPU shared buffer zero-copy path: wrap existing USM host pointer.
+        // Only works if the data pointer still falls within the shared buffer range,
+        // meaning the constant was NOT relocated by graph transformations.
+        // If the GPU compiled model used the same OCL/L0 context for the shared
+        // buffer allocation, share_usm wraps it without a copy.
+        if (!needs_conversion && constLayout.bytes_count() > 0 &&
+            p.is_shared_weight_ptr(data, constLayout.bytes_count())) {
+            auto mem = p.get_engine().share_usm(constLayout,
+                           static_cast<cldnn::shared_handle>(const_cast<char*>(data)));
+            GPU_DEBUG_LOG << "[" << initialconstPrimID << ": constant] XPU shared: layout "
+                          << constLayout.to_short_string() << ", shared_usm_ptr(" << static_cast<const void*>(data) << ")" << std::endl;
+            if (std::getenv("OV_XPU_DEBUG")) {
+                std::cerr << "[XPU-ZC] SHARED (zero-copy) " << initialconstPrimID
+                          << " " << constLayout.to_short_string()
+                          << " bytes=" << constLayout.bytes_count() << std::endl;
+            }
+            p.add_primitive(*op, cldnn::data(initialconstPrimID, mem));
+            p.blobMemCache[cache_key] = initialconstPrimID;
+            constPrimID = initialconstPrimID;
+        } else {
+            if (std::getenv("OV_XPU_DEBUG") && constLayout.bytes_count() >= 262144) {
+                std::cerr << "[XPU-ZC] COPIED " << initialconstPrimID
+                          << " " << constLayout.to_short_string()
+                          << " bytes=" << constLayout.bytes_count()
+                          << " in_range=" << (constLayout.bytes_count() > 0 && p.is_shared_weight_ptr(data, constLayout.bytes_count()))
+                          << " needs_conv=" << needs_conversion << std::endl;
+            }
         cldnn::memory::ptr mem = nullptr;
         if (constLayout.bytes_count() > 0) {
             mem = p.get_engine().allocate_memory(constLayout, false);
@@ -150,6 +193,7 @@ static void create_data(ProgramBuilder& p, const ov::Shape& const_shape, const s
         p.add_primitive(*op, cldnn::data(initialconstPrimID, mem));
         p.blobMemCache[cache_key] = initialconstPrimID;
         constPrimID = initialconstPrimID;
+        }  // end else (original alloc+copy path)
     }
 }
 

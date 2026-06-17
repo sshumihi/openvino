@@ -89,6 +89,8 @@ private:
                                                          const ov::npuw::s11n::CompiledContext& ctx);
 
     std::string m_name;
+    std::string m_weights_bank_name;
+    std::shared_ptr<ov::npuw::weights::Bank> m_weights_bank;
     std::shared_ptr<::intel_npu::OptionsDesc> m_options_desc;
     ::intel_npu::Config m_cfg;
     GetPropertiesMap m_prop_to_opt;
@@ -110,6 +112,16 @@ private:
     // Multiple generate models with different static KV cache shapes (1K, 2K, 4K, 8K stepping)
     std::vector<std::shared_ptr<ov::npuw::ICompiledModel_v0>> m_generate_compiled_variants;
     std::vector<uint32_t> m_kvcache_sizes;  // Corresponding KV cache sizes for each variant
+
+    // Shared KV cache buffer from XPU plugin (GPU USM). Non-owning.
+    void* m_kvcache_buffer_ptr = nullptr;
+    size_t m_kvcache_buffer_size = 0;
+
+    // External prefill signal from the XPU plugin. Set (via the XPU_EXTERNAL_PREFILL_LEN property) AFTER the
+    // reused LLMInferRequest is created; the request consumes it at the top of its next infer() — calling
+    // init_from_external_prefill(len) and resetting it to 0 (one-shot per conversation). Not consumed at
+    // construction (the request is created once and reused, not recreated per prefill).
+    uint64_t m_external_prefill_len = 0;
 
     // Support LoRA
     uint32_t m_max_lora_rank = 32;
@@ -140,6 +152,15 @@ private:
                                          const ov::AnyMap& generate_config);
 
     bool m_is_eagle = false;
+
+    // Diagnostic counters from last refresh_bank_closures() call
+    size_t m_closure_refresh_total = 0;
+    size_t m_closure_refresh_in_buf = 0;
+    // Number of unique host-side closures relocated into the XPU shared buffer
+    size_t m_closure_host_relocated = 0;
+    // Post-consolidation count of ALL closures (bank + host) and how many are in buffer
+    size_t m_closure_all_in_buffer = 0;
+    size_t m_closure_all_total = 0;
 };
 
 }  // namespace npuw

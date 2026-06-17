@@ -8,6 +8,7 @@
 #include "swiglu/swiglu_kernel_base.h"
 #include <vector>
 #include <functional>
+#include <cstdlib>
 #include "common_types.h"
 
 static constexpr size_t lws_batches = 8;
@@ -315,6 +316,22 @@ bool FullyConnected_bf_tiled::Validate(const Params& params) const {
 
     auto& fc_params = static_cast<const fully_connected_params&>(params);
     auto& input = fc_params.inputs[0];
+
+    // XPU zero-copy weight sharing: when OV_XPU_REF_COMPRESSED_FC is set, decline
+    // this (blocked-layout) kernel for compressed INT4/UINT4 FCs so the selector
+    // falls back to FullyConnected_bfyx_Ref, which reads weights in plain row-major
+    // oiyx layout. With no blocked weight reorder, the FC binds the u4 weight
+    // constant directly from the XPU shared buffer via is_shared_weight_ptr ->
+    // share_usm (no allocate+copy) — i.e. weights become zero-copy like the KV cache.
+    {
+        static const bool xpu_force_ref_compressed_fc = (std::getenv("OV_XPU_REF_COMPRESSED_FC") != nullptr);
+        if (xpu_force_ref_compressed_fc && fc_params.compressed &&
+            (fc_params.weights.GetDType() == WeightsType::INT4 ||
+             fc_params.weights.GetDType() == WeightsType::UINT4)) {
+            DO_NOT_USE_THIS_KERNEL(params.layerID);
+        }
+    }
+
     auto& output = fc_params.outputs[0];
     auto& weights = fc_params.weights;
 

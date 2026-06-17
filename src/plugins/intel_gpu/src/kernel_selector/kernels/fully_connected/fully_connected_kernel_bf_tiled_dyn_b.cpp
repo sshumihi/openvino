@@ -6,6 +6,7 @@
 #include "kernel_selector_utils.h"
 #include <vector>
 #include <functional>
+#include <cstdlib>
 #include "common_types.h"
 
 static constexpr size_t simd = 16;
@@ -99,6 +100,19 @@ bool FullyConnected_bf_tiled_dyn_b::Validate(const Params& params) const {
     }
 
     auto& fc_params = static_cast<const fully_connected_params&>(params);
+
+    // XPU zero-copy weight sharing: decline for compressed INT4 FCs when the flag is
+    // set, so the selector falls back to FullyConnected_bfyx_Ref (oiyx, no reorder).
+    // See FullyConnected_bf_tiled::Validate for details.
+    {
+        static const bool xpu_force_ref_compressed_fc = (std::getenv("OV_XPU_REF_COMPRESSED_FC") != nullptr);
+        if (xpu_force_ref_compressed_fc && fc_params.compressed &&
+            (fc_params.weights.GetDType() == WeightsType::INT4 ||
+             fc_params.weights.GetDType() == WeightsType::UINT4)) {
+            DO_NOT_USE_THIS_KERNEL(params.layerID);
+        }
+    }
+
     auto& input = fc_params.inputs[0];
     auto& output = fc_params.outputs[0];
     auto& weights = fc_params.weights;

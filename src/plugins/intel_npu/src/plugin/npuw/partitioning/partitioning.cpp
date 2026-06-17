@@ -3,8 +3,21 @@
 //
 
 #include "partitioning.hpp"
+#include "../xpu_debug.hpp"
 
 #include <memory>
+
+#ifdef _WIN32
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+//
+#    include <psapi.h>
+#endif
 
 #include "../logging.hpp"
 #include "../util.hpp"
@@ -2409,7 +2422,10 @@ void Partitioner::decompressionCutOff(const std::string& func_name) {
     LOG_VERB("Decompression cut-off for function " << func_name << " in model " << model->get_friendly_name() << "...");
     LOG_BLOCK();
 
+    ::ov::npuw::xpu_dbg() << "[DCOFF] decompressionCutOff called for func=" << func_name << std::endl;
+
     std::string dcoff_type_opt = cfg.getString<::intel_npu::NPUW_DCOFF_TYPE>();
+    ::ov::npuw::xpu_dbg() << "[DCOFF] dcoff_type_opt=\"" << dcoff_type_opt << "\"" << std::endl;
     ov::element::Type dcoff_type{};
     if (!dcoff_type_opt.empty()) {
         if (dcoff_type_opt == "i8") {
@@ -2482,6 +2498,15 @@ void Partitioner::decompressionCutOff(const std::string& func_name) {
         rewr.add_matcher<ov::npuw::patterns::AsymmZP::DCOFFPassReshape>(dcoff_mode, dcoff_type, std::ref(params_to));
 
         rewr.run_on_model(f._model);
+
+        ::ov::npuw::xpu_dbg() << "[DCOFF] After matchers: scales=" << params_to.scales.size()
+                  << " zerops=" << params_to.zerops.size()
+                  << " zerops_asymm=" << params_to.zerops_asymm.size() << std::endl;
+        // Dump param types after DCOFF
+        for (auto&& input : f._model->inputs()) {
+            ::ov::npuw::xpu_dbg() << "[DCOFF]   param: " << input.get_element_type()
+                      << " " << input.get_partial_shape() << std::endl;
+        }
 
         ov::pass::Validate val;
         val.run_on_model(f._model);
@@ -2595,11 +2620,27 @@ void Partitioner::finalizeLinks() {
 
 }  // namespace
 
+static double pt_committed_mb() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+        return static_cast<double>(pmc.PrivateUsage) / 1048576.0;
+#endif
+    return 0.0;
+}
+#define PT_MEM(tag)                                                                                  \
+    do {                                                                                             \
+        if (std::getenv("XPU_MEM_DEBUG"))                                                            \
+            std::cerr << "[PART][MEM] " << (tag) << ": " << pt_committed_mb() << " MB" << std::endl; \
+    } while (0)
+
 ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model>& model,
                                                  ::intel_npu::Config& cfg,
                                                  const ov::npuw::PartitioningContext& ctx) {
     LOG_INFO("Building partitioning for model " << model->get_friendly_name() << "...");
     LOG_BLOCK();
+    PT_MEM("getPartitioning entry");
 
     ov::npuw::Ensemble ens;
     ov::npuw::Partitioning P;
@@ -2640,6 +2681,7 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
     } else {
         ens = load_groups(model, file_path);
     }
+    PT_MEM("after buildPartitioning (online)");
 
     const bool dump_full_opt = cfg.get<::intel_npu::NPUW_DUMP_FULL>();
 
@@ -2704,17 +2746,23 @@ ov::npuw::Partitioning ov::npuw::getPartitioning(const std::shared_ptr<ov::Model
                 p.propagateSlices(func_group);
                 p.propagateConverts(func_group);
                 p.propagateWeights(func_group);
+                PT_MEM("  after propagateWeights");
                 p.propagateScalars(func_group);
                 p.propagateConvertsOut(func_group);
                 p.sanityCheck(func_group);
                 p.saveRepeatedConstants(func_group);
+                PT_MEM("  after saveRepeatedConstants");
                 p.saveTailDictConstants(func_group);
+                PT_MEM("  after saveTailDictConstants");
                 p.matchParameters(func_group);
                 p.matchResults(func_group);
                 p.matchRepeatedSubgraphs(func_group);  // This populates P.functions
+                PT_MEM("  after matchRepeatedSubgraphs");
                 p.spatial(func_group);
                 p.attention(func_group);
+                PT_MEM("before optimize(func_group)");
                 p.optimize(func_group);
+                PT_MEM("after optimize(func_group)");
                 p.decompressionCutOff(func_group);
             }
 

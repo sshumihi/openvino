@@ -5,6 +5,7 @@
 #include "fully_connected_kernel_gemv.h"
 #include "fully_connected_kernel_bf_tiled.h"
 
+#include <cstdlib>
 #include "common_types.h"
 #include "kernel_selector_utils.h"
 #include "swiglu/swiglu_kernel_base.h"
@@ -52,6 +53,18 @@ bool FullyConnected_GEMV::Validate(const Params& params) const {
         DO_NOT_USE_THIS_KERNEL(params.layerID);
 
     const auto& fc_params = static_cast<const fully_connected_params&>(params);
+
+    // XPU zero-copy weight sharing: decline for compressed INT4 FCs when the flag is
+    // set, so the selector falls back to FullyConnected_bfyx_Ref (oiyx, no reorder).
+    {
+        static const bool xpu_force_ref_compressed_fc = (std::getenv("OV_XPU_REF_COMPRESSED_FC") != nullptr);
+        if (xpu_force_ref_compressed_fc && fc_params.compressed &&
+            (fc_params.weights.GetDType() == WeightsType::INT4 ||
+             fc_params.weights.GetDType() == WeightsType::UINT4)) {
+            DO_NOT_USE_THIS_KERNEL(params.layerID);
+        }
+    }
+
     const auto& input = fc_params.inputs[0];
     const auto& output = fc_params.outputs[0];
     const auto& weights = fc_params.weights;

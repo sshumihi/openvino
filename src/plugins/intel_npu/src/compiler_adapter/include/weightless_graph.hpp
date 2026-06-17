@@ -103,6 +103,13 @@ private:
     void release_init_blob(const size_t initIndex);
     void release_graphs();
 
+    /// Check whether a pointer falls within the XPU shared weight buffer.
+    static bool is_xpu_shared_weight(const void* ptr, size_t size, const void* shared_start, size_t shared_size);
+
+    /// After init schedules complete, copy their outputs into the XPU shared buffer
+    /// and free L0 allocations. Replaces view tensors so set_weights_inputs() uses the shared buffer.
+    void consolidate_to_shared_buffer();
+
     std::vector<GraphDescriptor> _initsGraphDesc;
     std::optional<std::vector<ov::Tensor>> _initBlobs;
     std::vector<NetworkMetadata> _initsMetadata;
@@ -124,6 +131,10 @@ private:
      */
     mutable std::unordered_map<std::string, std::shared_ptr<ov::ITensor>> _mainInputsViewTensors;
     Logger _wgLogger;  // Uses the "WeightlessGraph" domain
+
+    // XPU shared weight buffer range (read from model rt_info before _model is released)
+    const void* _xpu_shared_start = nullptr;
+    size_t _xpu_shared_size = 0;
 };
 
 }  // namespace intel_npu

@@ -224,6 +224,22 @@ public:
     void set_weights_bank(std::shared_ptr<ov::npuw::weights::Bank>) override {}
     void finalize_weights_bank() override {}
     void reconstruct_closure() override {}
+    std::pair<size_t, size_t> refresh_bank_closures() override {
+        return {0, 0};
+    }
+    std::size_t host_closure_bytes(std::set<const void*>&) const override {
+        return 0;
+    }
+    std::size_t consolidate_host_closures(std::uint8_t*,
+                                          std::size_t,
+                                          std::size_t offset,
+                                          std::map<const void*, void*>&) override {
+        return offset;
+    }
+    std::pair<std::size_t, std::size_t> count_closures_in_buffer(const std::uint8_t*,
+                                                                 std::size_t) const override {
+        return {0, 0};
+    }
     void serialize(std::ostream&, const ov::npuw::s11n::CompiledContext&) const override {}
 };
 

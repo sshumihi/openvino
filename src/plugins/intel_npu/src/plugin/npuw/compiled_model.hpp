@@ -4,7 +4,10 @@
 
 #pragma once
 
+#include <cstdint>
+#include <map>
 #include <optional>
+#include <set>
 
 #include "attention.hpp"
 #include "base_sync_infer_request.hpp"
@@ -62,9 +65,34 @@ public:
     virtual void set_weights_bank(std::shared_ptr<weights::Bank> bank) = 0;
     virtual void finalize_weights_bank() = 0;
     virtual void reconstruct_closure() = 0;
+    // Refresh closures to point to Bank-managed tensors (e.g. after consolidation).
+    // Returns {closures_refreshed, closures_in_xpu_buffer}.
+    virtual std::pair<size_t,size_t> refresh_bank_closures() = 0;
+
+    // Host-side closures (closure_uid < 0) live as plain CPU-heap ov::Tensors and
+    // bypass the weights Bank, so they are NOT covered by consolidate_to_xpu_buffer.
+    // These two methods let the XPU shared-buffer path account for and relocate them
+    // so that *all* weights end up in the shared buffer.
+    //   host_closure_bytes: add each unique (by data pointer) host closure's byte
+    //     size into `seen`-deduplicated total. Used to size the shared buffer.
+    //   consolidate_host_closures: memcpy host closures into [buf+offset, ...),
+    //     dedup via `relocated` (src ptr -> dst ptr), rebind the closure tensor to
+    //     the shared buffer. Returns the updated write offset.
+    virtual std::size_t host_closure_bytes(std::set<const void*>& seen) const = 0;
+    virtual std::size_t consolidate_host_closures(std::uint8_t* buf,
+                                                  std::size_t buf_size,
+                                                  std::size_t offset,
+                                                  std::map<const void*, void*>& relocated) = 0;
+    // Count ALL non-null closures (bank + host) and how many have their data inside
+    // [buf, buf+size). Returns {in_buffer, total}. Used to prove full consolidation.
+    virtual std::pair<std::size_t, std::size_t> count_closures_in_buffer(const std::uint8_t* buf,
+                                                                         std::size_t size) const = 0;
 
     // Serialization
     virtual void serialize(std::ostream& stream, const s11n::CompiledContext& ctx) const = 0;
+
+    // Wait for async weight evaluation to complete
+    virtual void wait_for_weights_evaluation();
 
     virtual ~ICompiledModel_v0() = default;
 };
@@ -131,7 +159,16 @@ public:
     void set_weights_bank(std::shared_ptr<weights::Bank> bank) override;
     void finalize_weights_bank() override;
     void reconstruct_closure() override;
+    std::pair<size_t,size_t> refresh_bank_closures() override;
+    std::size_t host_closure_bytes(std::set<const void*>& seen) const override;
+    std::size_t consolidate_host_closures(std::uint8_t* buf,
+                                          std::size_t buf_size,
+                                          std::size_t offset,
+                                          std::map<const void*, void*>& relocated) override;
+    std::pair<std::size_t, std::size_t> count_closures_in_buffer(const std::uint8_t* buf,
+                                                                 std::size_t size) const override;
     void serialize(std::ostream& stream, const s11n::CompiledContext& ctx) const override;
+    void wait_for_weights_evaluation() override;
 
 private:
     // FIXME: This class has many friends..

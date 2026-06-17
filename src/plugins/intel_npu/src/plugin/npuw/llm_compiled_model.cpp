@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 #include "llm_compiled_model.hpp"
+#include "xpu_debug.hpp"
+
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <set>
 
 #include "embedding/embedding_infer_request.hpp"
 #include "embedding/prepare_embedding_model.hpp"
@@ -47,7 +53,37 @@
 
 namespace opp = ov::pass::pattern;
 
+#ifdef _WIN32
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+//
+#    include <psapi.h>
+#endif
+
 namespace {
+
+// Process private/committed bytes (MB) for the [NPUW][MEM] compile-step breakdown
+// (gated on XPU_MEM_DEBUG).
+inline double npuw_committed_mb() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+        return static_cast<double>(pmc.PrivateUsage) / 1048576.0;
+#endif
+    return 0.0;
+}
+#define NPUW_MEM(tag)                                                                                  \
+    do {                                                                                               \
+        if (std::getenv("XPU_MEM_DEBUG"))                                                              \
+            std::cout << "[NPUW][MEM] " << (tag) << ": " << npuw_committed_mb() << " MB" << std::endl; \
+    } while (0)
+
 template <typename T, typename = std::enable_if_t<std::is_integral<T>::value>>
 T align_to(T value, T alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
@@ -1024,10 +1060,34 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
 
     // Generate a random weights bank name unique to this LLMCompiledModel object
-    auto weights_bank_name = ov::npuw::util::generate_random_string();
-    LOG_VERB("Generated a unique weights bank name: " << weights_bank_name);
-    apply_weights_bank_name(prefill_config, weights_bank_name);
-    apply_weights_bank_name(generate_config, weights_bank_name);
+    m_weights_bank_name = ov::npuw::util::generate_random_string();
+    LOG_VERB("Generated a unique weights bank name: " << m_weights_bank_name);
+    apply_weights_bank_name(prefill_config, m_weights_bank_name);
+    apply_weights_bank_name(generate_config, m_weights_bank_name);
+
+    // Pre-create Bank before sub-CompiledModels.
+    // When sub-CompiledModels request the same bank_name, they get this pre-configured instance.
+    {
+        m_weights_bank = ov::npuw::weights::bank(m_weights_bank_name, plugin->get_core(), "");
+        auto xpu_ptr_it = properties.find("XPU_SHARED_WEIGHT_PTR");
+        if (xpu_ptr_it != properties.end()) {
+            // Legacy path: pre-allocated buffer
+            auto ptr = reinterpret_cast<void*>(xpu_ptr_it->second.as<uint64_t>());
+            auto size = properties.at("XPU_SHARED_WEIGHT_SIZE").as<uint64_t>();
+            auto offset = properties.count("XPU_SHARED_WEIGHT_ALLOC_OFFSET")
+                              ? properties.at("XPU_SHARED_WEIGHT_ALLOC_OFFSET").as<uint64_t>()
+                              : size;
+            m_weights_bank->set_xpu_shared_buffer(ptr, static_cast<size_t>(size), static_cast<size_t>(offset));
+        }
+        // If no XPU_SHARED_WEIGHT_PTR: deferred mode — XPU plugin will allocate after eval
+        // XPU raw-weight ranges at COMPILE time: register them on the bank BEFORE the sub-models
+        // evaluate so evaluate_cpu() stores zero-copy views of raw-resident closures (the shared
+        // malloc) instead of materializing a host copy of the weights.
+        auto xpu_ranges_it = properties.find("XPU_RAW_WEIGHT_RANGES");
+        if (xpu_ranges_it != properties.end()) {
+            m_weights_bank->set_xpu_raw_ranges(xpu_ranges_it->second.as<std::string>());
+        }
+    }
 
     // Handle attention hints. FIXME: Maybe it makes sense to make those
     // mutually exclusive with the precise configuration sections as well
@@ -1130,22 +1190,49 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
 
     // Compile multiple generate model variants with different sizes
+    NPUW_MEM("before generate variants compile");
     compile_generate_model_variants(generate_model_variants, plugin, generate_config);
+    NPUW_MEM("after generate variants compile");
 
-    m_prefill_compiled = m_compiled_model_factory(prefill_model, plugin, prefill_config);
-    NPUW_ASSERT(m_prefill_compiled && "Can't create ov::npuw::CompiledModel for passed prefill "
-                                      "model and its config, please check passed config.");
+    if (properties.find("XPU_SKIP_NPU_PREFILL") != properties.end()) {
+        // XPU hybrid: the GPU performs prefill, so this NPU prefill model is never executed. Alias
+        // it to the generate model to satisfy bank/serialize/consolidation references WITHOUT
+        // compiling a second model — saving a full ~2GB weight materialization + its L0 blob.
+        // (Inference never calls the NPU prefill in hybrid mode: init_from_external_prefill bypasses
+        // it. Consolidation loops dedup by pointer, so re-visiting the generate model is idempotent.)
+        m_prefill_compiled = m_kvcache_compiled;
+        LOG_INFO("[NPUW] XPU_SKIP_NPU_PREFILL: NPU prefill model compile skipped (aliased to generate)");
+    } else {
+        m_prefill_compiled = m_compiled_model_factory(prefill_model, plugin, prefill_config);
+        NPUW_ASSERT(m_prefill_compiled && "Can't create ov::npuw::CompiledModel for passed prefill "
+                                          "model and its config, please check passed config.");
+    }
+    NPUW_MEM("after prefill compile");
     if (lm_head_model) {
         auto lm_head_config = get_default_lm_head_config(npudesc);
         merge_config_with(lm_head_config, other_props);
         auto lm_head_config_addition_value = lm_head_config_addition.value_or(ov::AnyMap{}).as<ov::AnyMap>();
         merge_config_with(lm_head_config, lm_head_config_addition_value);
 
-        apply_weights_bank_name(lm_head_config, weights_bank_name);
+        apply_weights_bank_name(lm_head_config, m_weights_bank_name);
 
         m_lm_head_compiled = m_compiled_model_factory(lm_head_model, plugin, lm_head_config);
         NPUW_ASSERT(m_lm_head_compiled);
     }
+    NPUW_MEM("after lm_head compile");
+
+    // If no pre-allocated shared buffer, wait for evaluations to complete
+    // so the XPU plugin can query total size and allocate.
+    if (properties.find("XPU_SHARED_WEIGHT_PTR") == properties.end()) {
+        for (auto& v : m_generate_compiled_variants) {
+            v->wait_for_weights_evaluation();
+        }
+        m_prefill_compiled->wait_for_weights_evaluation();
+        if (m_lm_head_compiled) {
+            m_lm_head_compiled->wait_for_weights_evaluation();
+        }
+    }
+    NPUW_MEM("after wait_for_weights_evaluation");
 
     implement_properties();
     LOG_DEBUG("Done");
@@ -1525,10 +1612,195 @@ std::shared_ptr<const ov::Model> ov::npuw::LLMCompiledModel::get_runtime_model()
 }
 
 void ov::npuw::LLMCompiledModel::set_property(const ov::AnyMap& properties) {
-    OPENVINO_NOT_IMPLEMENTED;
+    bool handled = false;
+
+    // Register the GPU-shared raw weight buffer so plain Const closures that are
+    // byte-identical to it are pointed AT it (zero-copy) instead of copied into the
+    // persistent buffer. Must be set BEFORE NPUW_WEIGHTS_TOTAL_BYTES is queried so the
+    // persistent buffer is sized to exclude raw-resident closures.
+    auto raw_ranges_it = properties.find("XPU_RAW_WEIGHT_RANGES");
+    if (raw_ranges_it != properties.end()) {
+        m_weights_bank->set_xpu_raw_ranges(raw_ranges_it->second.as<std::string>());
+        handled = true;
+    }
+
+    auto ptr_it = properties.find("XPU_SHARED_WEIGHT_PTR");
+    if (ptr_it != properties.end()) {
+        auto ptr = reinterpret_cast<void*>(ptr_it->second.as<uint64_t>());
+        auto size = properties.at("XPU_SHARED_WEIGHT_SIZE").as<uint64_t>();
+        // The Bank occupies [0, bank_total); host closures (below) occupy the rest.
+        const size_t bank_total = m_weights_bank->get_total_tensor_bytes();
+        m_weights_bank->set_xpu_shared_buffer(ptr, static_cast<size_t>(size), 0);
+        m_weights_bank->consolidate_to_xpu_buffer();
+
+        // Refresh closures: replace stale CPU-heap tensors with shared-buffer pointers
+        size_t total_refreshed = 0, total_in_buf = 0;
+        for (auto& v : m_generate_compiled_variants) {
+            auto [r, b] = v->refresh_bank_closures();
+            total_refreshed += r; total_in_buf += b;
+        }
+        {
+            auto [r, b] = m_prefill_compiled->refresh_bank_closures();
+            total_refreshed += r; total_in_buf += b;
+        }
+        if (m_lm_head_compiled) {
+            auto [r, b] = m_lm_head_compiled->refresh_bank_closures();
+            total_refreshed += r; total_in_buf += b;
+        }
+        m_closure_refresh_total = total_refreshed;
+        m_closure_refresh_in_buf = total_in_buf;
+
+        // Host-side closures (closure_uid < 0) bypass the Bank and remain on CPU
+        // heap. Relocate them into the shared buffer too, so that *every* weight is
+        // cross-device accessible. Dedup by source pointer across all sub-models so
+        // a closure shared between prefill/generate/lm_head is copied once. The
+        // write region starts right after the Bank's region [bank_total, size).
+        auto* buf = static_cast<std::uint8_t*>(ptr);
+        size_t host_off = bank_total;
+        std::map<const void*, void*> relocated;
+        for (auto& v : m_generate_compiled_variants) {
+            host_off = v->consolidate_host_closures(buf, static_cast<size_t>(size), host_off, relocated);
+        }
+        host_off = m_prefill_compiled->consolidate_host_closures(buf, static_cast<size_t>(size), host_off, relocated);
+        if (m_lm_head_compiled) {
+            host_off = m_lm_head_compiled->consolidate_host_closures(buf, static_cast<size_t>(size), host_off, relocated);
+        }
+        m_closure_host_relocated = relocated.size();
+
+        // Definitive check: count ALL closures (bank + host) and how many now point
+        // into the shared buffer. This is the proof that every weight is in the buffer.
+        auto* cbuf = static_cast<const std::uint8_t*>(ptr);
+        size_t all_in = 0, all_total = 0;
+        for (const auto& v : m_generate_compiled_variants) {
+            auto [i, t] = v->count_closures_in_buffer(cbuf, static_cast<size_t>(size));
+            all_in += i; all_total += t;
+        }
+        {
+            auto [i, t] = m_prefill_compiled->count_closures_in_buffer(cbuf, static_cast<size_t>(size));
+            all_in += i; all_total += t;
+        }
+        if (m_lm_head_compiled) {
+            auto [i, t] = m_lm_head_compiled->count_closures_in_buffer(cbuf, static_cast<size_t>(size));
+            all_in += i; all_total += t;
+        }
+        m_closure_all_in_buffer = all_in;
+        m_closure_all_total = all_total;
+        ::ov::npuw::xpu_dbg() << "[DIAG] host-closure consolidation: relocated " << relocated.size()
+                  << " unique host tensors, final offset=" << host_off << "/" << size
+                  << " (bank ended at " << bank_total << ")" << std::endl;
+        ::ov::npuw::xpu_dbg() << "[DIAG] ALL closures in shared buffer: " << all_in << "/" << all_total
+                  << (all_in == all_total ? "  <-- 100% CONSOLIDATED" : "  <-- INCOMPLETE!") << std::endl;
+        handled = true;
+    }
+
+    auto kv_it = properties.find("XPU_SHARED_KVCACHE_PTR");
+    if (kv_it != properties.end()) {
+        m_kvcache_buffer_ptr = reinterpret_cast<void*>(kv_it->second.as<uint64_t>());
+        m_kvcache_buffer_size = static_cast<size_t>(properties.at("XPU_SHARED_KVCACHE_SIZE").as<uint64_t>());
+        handled = true;
+    }
+
+    auto ext_prefill_it = properties.find("XPU_EXTERNAL_PREFILL_LEN");
+    if (ext_prefill_it != properties.end()) {
+        m_external_prefill_len = ext_prefill_it->second.as<uint64_t>();
+        handled = true;
+    }
+
+    if (!handled) {
+        OPENVINO_NOT_IMPLEMENTED;
+    }
 }
 
 ov::Any ov::npuw::LLMCompiledModel::get_property(const std::string& name) const {
+    if (name == "NPUW_WEIGHTS_TOTAL_BYTES") {
+        return static_cast<uint64_t>(m_weights_bank->get_total_tensor_bytes());
+    }
+    if (name == "NPUW_HOST_CLOSURE_TOTAL_BYTES") {
+        // Bytes needed to relocate host-side closures (closure_uid < 0) into the
+        // shared buffer, deduplicated by data pointer across all sub-models. The
+        // XPU plugin adds this to NPUW_WEIGHTS_TOTAL_BYTES when sizing the buffer.
+        std::set<const void*> seen;
+        std::size_t total = 0;
+        for (const auto& v : m_generate_compiled_variants) {
+            total += v->host_closure_bytes(seen);
+        }
+        total += m_prefill_compiled->host_closure_bytes(seen);
+        if (m_lm_head_compiled) {
+            total += m_lm_head_compiled->host_closure_bytes(seen);
+        }
+        return static_cast<uint64_t>(total);
+    }
+    if (name == "NPUW_HOST_CLOSURE_RELOCATED_COUNT") {
+        return static_cast<uint64_t>(m_closure_host_relocated);
+    }
+    if (name == "NPUW_ALL_CLOSURES_IN_BUFFER") {
+        // "in_buffer/total" across ALL closures (bank + host) after consolidation.
+        return std::string(std::to_string(m_closure_all_in_buffer) + "/" +
+                           std::to_string(m_closure_all_total));
+    }
+    if (name == "NPUW_KVCACHE_TOTAL_BYTES") {
+        uint64_t total = 0;
+        auto largest = m_generate_compiled_variants.back();
+        for (const auto& port : largest->inputs()) {
+            if (port.get_any_name().find("past_key_values") != std::string::npos) {
+                total += ov::shape_size(port.get_shape()) * port.get_element_type().size();
+            }
+        }
+        return total;
+    }
+    if (name == "NPUW_KVCACHE_DESC_DIM") {
+        return static_cast<uint64_t>(m_kvcache_desc.dim);
+    }
+    if (name == "NPUW_KVCACHE_DESC_MAX_PROMPT_SIZE") {
+        return static_cast<uint64_t>(m_kvcache_desc.max_prompt_size);
+    }
+    if (name == "NPUW_KVCACHE_DESC_TOTAL_SIZE") {
+        return static_cast<uint64_t>(m_kvcache_desc.total_size);
+    }
+    if (name == "NPUW_KVCACHE_V_TRANSPOSED_GEN") {
+        return m_kvcache_desc.v_tensors_transposed_gen;
+    }
+    if (name == "NPUW_KVCACHE_LAYOUT") {
+        // Return serialized layout: name:offset:elem_type:shape_str;...
+        // Built from the largest generate variant's sorted past_key_values inputs
+        auto largest = m_generate_compiled_variants.back();
+        std::vector<std::pair<std::string, ov::Output<const ov::Node>>> kv_ports;
+        for (const auto& port : largest->inputs()) {
+            auto pname = port.get_any_name();
+            if (pname.find("past_key_values") != std::string::npos) {
+                kv_ports.emplace_back(pname, port);
+            }
+        }
+        // Sort by name (alphabetical) — matches the order used in buffer allocation
+        std::sort(kv_ports.begin(), kv_ports.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        std::string layout;
+        uint64_t offset = 0;
+        for (const auto& [pname, port] : kv_ports) {
+            auto shape = port.get_shape();
+            auto elem_size = port.get_element_type().size();
+            auto byte_size = ov::shape_size(shape) * elem_size;
+
+            std::string shape_str;
+            for (size_t i = 0; i < shape.size(); i++) {
+                if (i > 0) shape_str += ",";
+                shape_str += std::to_string(shape[i]);
+            }
+
+            if (!layout.empty()) layout += ";";
+            layout += pname + ":" + std::to_string(offset) + ":" +
+                      port.get_element_type().to_string() + ":" + shape_str;
+            offset += byte_size;
+        }
+        return layout;
+    }
+    if (name == "NPUW_CLOSURE_IN_BUFFER_COUNT") {
+        // Return "in_buffer/total" from last refresh_bank_closures() call
+        return std::string(std::to_string(m_closure_refresh_in_buf) + "/" +
+                           std::to_string(m_closure_refresh_total));
+    }
+
     OPENVINO_SUPPRESS_DEPRECATED_START
     if (name == ov::intel_npu::npuw::llm::prefill_config.name() ||
         name == ov::intel_npu::npuw::llm::generate_config.name()) {

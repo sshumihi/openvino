@@ -100,6 +100,12 @@ public:
     using BlobCacheKey = std::tuple<const char*, ov::Shape, ov::element::Type>;
     std::map<BlobCacheKey, cldnn::primitive_id> blobMemCache;
 
+    // Register the set of XPU shared weight buffers (serialized "ptr:size;ptr:size;...").
+    // Each buffer is <= 2GB so the GPU can address it; constants viewing any of them are
+    // bound zero-copy via share_usm.
+    void set_shared_weight_ranges(const std::string& serialized);
+    bool is_shared_weight_ptr(const void* ptr, size_t byte_count) const;
+
     std::shared_ptr<cldnn::program> get_compiled_program() const;
     std::shared_ptr<cldnn::topology> get_topology() const { return m_topology; }
 
@@ -161,6 +167,9 @@ private:
     std::shared_ptr<cldnn::ICompilationContext> m_compilation_context;
 
     bool m_is_inner_program = false;
+
+    // Per-weight XPU shared buffer ranges [start, start+size). Each <= 2GB.
+    std::vector<std::pair<const char*, size_t>> m_shared_weight_ranges;
 
     void EnableQueryMode() { queryMode = true; }
     void DisableQueryMode() { queryMode = false; }

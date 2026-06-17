@@ -327,6 +327,11 @@ void WeightlessGraph::initialize_impl(const FilteredConfig& config) {
     run_init_multi_threaded();
 #endif
 
+    // Consolidate init outputs into XPU shared buffer (overwrites raw weights)
+    if (_xpu_shared_start != nullptr) {
+        consolidate_to_shared_buffer();
+    }
+
     if (_initBlobs != std::nullopt) {  // Do not release the graph when compiling a model on the CiD path, and we don't
                                        // have a blob. We may need it to export later.
         release_graphs();
@@ -354,8 +359,65 @@ WeightlessGraph::InputData WeightlessGraph::allocate_inputs(
             ov::util::get_memory_size(descriptor.precision, shape_size(descriptor.shapeFromCompiler.to_shape()));
     }
 
-    // Due to the large number of init inputs, allocating a single buffer for all of them is more efficient. "View
-    // tensors" are used for separating them.
+    // Check if XPU shared buffer is available and all constants fall within it
+    bool all_in_shared_buf = (_xpu_shared_start != nullptr);
+    if (all_in_shared_buf) {
+        for (const IODescriptor& descriptor : _initsMetadata.at(initIndex).inputs) {
+            const size_t id = std::stoi(descriptor.nameFromCompiler);
+            auto constantIt = constants.find(id);
+            if (constantIt == constants.end()) {
+                all_in_shared_buf = false;
+                break;
+            }
+            const auto& constant = constantIt->second;
+            if (!is_xpu_shared_weight(constant->get_data_ptr(), constant->get_byte_size(),
+                                      _xpu_shared_start, _xpu_shared_size)) {
+                all_in_shared_buf = false;
+                break;
+            }
+        }
+    }
+
+    if (all_in_shared_buf) {
+        // XPU zero-copy path: create view tensors pointing directly into the shared buffer.
+        // No ZeroTensor allocation or memcpy needed.
+        _wgLogger.info("XPU shared buffer detected for init schedule %zu - using zero-copy path", initIndex);
+
+        std::vector<size_t> noLongerRequiredIds;
+        noLongerRequiredIds.reserve(_initsMetadata.at(initIndex).inputs.size());
+
+        for (const IODescriptor& descriptor : _initsMetadata.at(initIndex).inputs) {
+            const auto tensorShapeFromCompiler = descriptor.shapeFromCompiler.to_shape();
+            const size_t currentInputSize =
+                ov::util::get_memory_size(descriptor.precision, shape_size(tensorShapeFromCompiler));
+
+            const size_t id = std::stoi(descriptor.nameFromCompiler);
+            auto constantIt = constants.find(id);
+            OPENVINO_ASSERT(constantIt != constants.end());
+
+            const auto constant = constantIt->second;
+            OPENVINO_ASSERT(constant->get_byte_size() == currentInputSize,
+                            "Binary size mismatch found for weights ID ",
+                            id,
+                            " between the model and compiled metadata.");
+
+            // Create view tensor pointing directly into the shared buffer (zero-copy)
+            void* ptr = const_cast<void*>(constant->get_data_ptr());
+            initInputsViewTensors.push_back(
+                ov::make_tensor(descriptor.precision, tensorShapeFromCompiler, ptr));
+
+            noLongerRequiredIds.push_back(id);
+        }
+
+        for (size_t id : noLongerRequiredIds) {
+            constants.erase(id);
+        }
+
+        // Return with nullptr hostTensor since no ZeroTensor was allocated
+        return {std::move(initInputsViewTensors), nullptr};
+    }
+
+    // Original path: allocate a single L0 buffer and copy weights into it
     const std::shared_ptr<ZeroTensor> initInputsAllocatedTensor =
         std::make_shared<ZeroTensor>(_zeroInitStruct, ov::element::Type_t::u8, ov::Shape({initInputsByteSize}), true);
 
@@ -446,6 +508,13 @@ void WeightlessGraph::run_init_single_threaded() {
     auto constants = get_all_constants_in_topological_order(_model, _wgLogger);
     const size_t numberOfInits = _initsGraphDesc.size();
 
+    // Extract XPU shared buffer info before releasing the model
+    if (_model && _model->has_rt_info("xpu_shared_weight_ptr")) {
+        _xpu_shared_start = reinterpret_cast<const void*>(
+            _model->get_rt_info<uint64_t>("xpu_shared_weight_ptr"));
+        _xpu_shared_size = _model->get_rt_info<uint64_t>("xpu_shared_weight_size");
+    }
+
     // Note: Delete model prematurely, constants are still valid due to
     // shared_ptr semantics.
     _model = nullptr;
@@ -469,6 +538,13 @@ void WeightlessGraph::run_init_multi_threaded() {
         _wgLogger.info("::run_init_multi_threaded() for single init - fallback to ::runInit()");
         run_init_single_threaded();
         return;
+    }
+
+    // Extract XPU shared buffer info before releasing the model
+    if (_model && _model->has_rt_info("xpu_shared_weight_ptr")) {
+        _xpu_shared_start = reinterpret_cast<const void*>(
+            _model->get_rt_info<uint64_t>("xpu_shared_weight_ptr"));
+        _xpu_shared_size = _model->get_rt_info<uint64_t>("xpu_shared_weight_size");
     }
 
     // the pipeline:
@@ -612,6 +688,51 @@ void WeightlessGraph::release_graphs() {
 
         _wgLogger.debug("Init blobs are released");
     }
+}
+
+bool WeightlessGraph::is_xpu_shared_weight(const void* ptr, size_t size,
+                                            const void* shared_start, size_t shared_size) {
+    if (!shared_start || !ptr)
+        return false;
+    auto start = static_cast<const char*>(shared_start);
+    auto p = static_cast<const char*>(ptr);
+    return p >= start && (p + size) <= (start + shared_size);
+}
+
+void WeightlessGraph::consolidate_to_shared_buffer() {
+    if (_mainInputsAllocatedTensors.empty()) {
+        _wgLogger.info("consolidate: no allocated tensors to relocate");
+        return;
+    }
+
+    // 1. Compute total init output size
+    size_t total_size = 0;
+    for (const auto& [name, tensor] : _mainInputsViewTensors) {
+        total_size += tensor->get_byte_size();
+    }
+
+    if (total_size > _xpu_shared_size) {
+        _wgLogger.warning("consolidate: init outputs (%zu) exceed shared buffer (%zu), skipping",
+                          total_size, _xpu_shared_size);
+        return;
+    }
+
+    // 2. Copy each view tensor into the shared buffer and replace the view
+    auto* dst = static_cast<unsigned char*>(const_cast<void*>(_xpu_shared_start));
+    size_t offset = 0;
+    for (auto& [name, viewTensor] : _mainInputsViewTensors) {
+        size_t sz = viewTensor->get_byte_size();
+        std::memcpy(dst + offset, viewTensor->data(), sz);
+        viewTensor = ov::make_tensor(viewTensor->get_element_type(),
+                                      viewTensor->get_shape(), dst + offset);
+        offset += sz;
+    }
+
+    // 3. Free L0 allocations
+    _mainInputsAllocatedTensors.clear();
+
+    _wgLogger.info("consolidate: relocated %zu bytes into shared buffer (%zu bytes remaining)",
+                   total_size, _xpu_shared_size - total_size);
 }
 
 WeightlessGraph::~WeightlessGraph() {

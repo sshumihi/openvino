@@ -1034,7 +1034,8 @@ void ov::npuw::JustInferRequest::legacy_infer(std::size_t real_idx, std::size_t 
     if (comp_model_desc.spatial) {
         unsafe_infer_spatial(real_idx, idx);
     } else {
-        r->infer();  // Run normally
+        r->start_async();  // Use async path — L0 backend may disallow sync infer()
+        r->wait();
     }
 }
 

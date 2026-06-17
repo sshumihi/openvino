@@ -48,11 +48,16 @@ endfunction()
 if(ENABLE_INTEL_NPU_COMPILER)
     message(STATUS "Resolving prebuilt NPU Plugin Compiler dependencies...")
 
-    set(PLUGIN_COMPILER_VERSION_MAJOR 7)
-    set(PLUGIN_COMPILER_VERSION_MINOR 7)
+    # Upgraded 7.7.0-a282305 -> 8.1.0-6268eb0 (OpenVINO 2026.2.0.1, LLVM 21.1.8) to test
+    # whether a newer VCL fixes the INT4 f16-subgraph miscompile on NPU. The 8_1_0-6268eb0
+    # package lives under the same .../windows/npu_compiler/ path as the old one.
+    # To revert: restore 7/7/0/a282305 and the original WINDOWS_2022 checksum below.
+    #   old: a282305, checksum aa94213af3deed2aaab216c7d39e0787cff002156428a432d1395f94cf23ca6f
+    set(PLUGIN_COMPILER_VERSION_MAJOR 8)
+    set(PLUGIN_COMPILER_VERSION_MINOR 1)
     set(PLUGIN_COMPILER_VERSION_PATCH 0)
-    set(PLUGIN_COMPILER_COMMIT_SHA a282305)
-    set(PLUGIN_COMPILER_WINDOWS_2022_CHECKSUM aa94213af3deed2aaab216c7d39e0787cff002156428a432d1395f94cf23ca6f)
+    set(PLUGIN_COMPILER_COMMIT_SHA 6268eb0)
+    set(PLUGIN_COMPILER_WINDOWS_2022_CHECKSUM 37eaa09bfed9f4d3ec5eca4612c8eae775ec3b9bf655638652ca8abe85729d49)
     set(PLUGIN_COMPILER_UBUNTU_22_04_CHECKSUM 789572fb15dc580484fac1b2f542842f5eb2834234410d059f0977ca14bbeb6a)
     set(PLUGIN_COMPILER_UBUNTU_24_04_CHECKSUM faece2ee29de4905301c80d872177527c4011e98639bbed6445b70e5ce543d5f)
 

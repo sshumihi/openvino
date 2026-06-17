@@ -28,6 +28,12 @@ public:
     ov::SoPtr<ov::ITensor> get_tensor(const ov::Output<const ov::Node>& port) const override;
     std::vector<ov::SoPtr<ov::IVariableState>> query_state() const override;
 
+    /// Initialize NPU generate state after an external (GPU) prefill.
+    /// KV data must already reside in the shared buffer. This selects the
+    /// appropriate generate variant, sets num_stored_tokens, and marks
+    /// generate as initialized (skipping copy_kvcache).
+    void init_from_external_prefill(int64_t prompt_length);
+
 protected:
     virtual void prepare_for_new_conversation();
     void prepare_for_new_conversation(int64_t prompt_length);

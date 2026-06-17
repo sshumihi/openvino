@@ -742,6 +742,19 @@ std::vector<LazyTensor::Transform> LazyTensor::get_transformations() const {
     return transformations;
 }
 
+std::pair<const void*, std::size_t> LazyTensor::const_source() const {
+    if (!m_impl) {
+        return {nullptr, 0};
+    }
+    // Only a directly-stored, un-transformed Const carries a source pointer into the
+    // model's weights tensor (the XPU raw shared buffer). Any wrapping transform
+    // (Unpack/Permute/Convert/Concat/Gather) materializes new data, so it is not raw-resident.
+    if (const auto* c = std::get_if<ov::npuw::weights::op::Const>(&m_impl->m_transform)) {
+        return {c->source_ptr(), c->source_byte_size()};
+    }
+    return {nullptr, 0};
+}
+
 void LazyTensor::detach() {
     if (m_impl) {
         m_impl->detach();
