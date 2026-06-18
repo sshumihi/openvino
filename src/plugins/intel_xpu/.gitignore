@@ -1,0 +1,5 @@
+# The repository-root .gitignore ignores every `doc/` directory (generated docs).
+# This plugin's doc/ (architecture report + end-to-end validation scripts) is intentional
+# and part of the plugin — keep it tracked.
+!doc/
+!doc/**
