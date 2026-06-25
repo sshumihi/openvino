@@ -54,16 +54,14 @@ ZeroTensor::ZeroTensor(const std::shared_ptr<ZeroInitStructsHolder>& init_struct
 }
 
 ZeroTensor::ZeroTensor(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
-                       const ov::SoPtr<ov::ITensor>& user_tensor,
-                       const bool is_input)
+                       const ov::SoPtr<ov::ITensor>& user_tensor)
     : _init_structs(init_structs),
       _logger("ZeroTensor", Logger::global().level()),
       _user_tensor(user_tensor),
       _element_type{_user_tensor->get_element_type()},
       _shape{_user_tensor->get_shape()},
       _strides{_element_type.bitwidth() >= 8 ? _user_tensor->get_strides() : ov::Strides{}},
-      _strides_once{},
-      _is_input(is_input) {
+      _strides_once{} {
     OPENVINO_ASSERT(_element_type.is_static());
 
     _bytes_capacity = get_bytes_capacity();
@@ -96,7 +94,7 @@ ZeroTensor::ZeroTensor(const std::shared_ptr<ZeroInitStructsHolder>& init_struct
     // _mem_ref will keep a reference to that allocation. Otherwise the function will try to import it into the level
     // zero context.
     _logger.debug("ZeroTensor::ZeroTensor - get tensor from pool or import it");
-    _mem_ref = zero_mem::import_standard_allocation_memory(_init_structs, _ptr, _bytes_capacity, _is_input);
+    _mem_ref = zero_mem::import_standard_allocation_memory(_init_structs, _ptr, _bytes_capacity);
 }
 
 // Note: Override data() members to not used OpenVINO library code to improve performance
@@ -238,7 +236,7 @@ bool ZeroTensor::can_be_reused() {
 void ZeroTensor::allocate_data() {
     _logger.debug("ZeroTensor::allocate_data - import the tensor data");
     _ptr = _user_tensor->data();
-    _mem_ref = zero_mem::import_standard_allocation_memory(_init_structs, _ptr, _bytes_capacity, _is_input);
+    _mem_ref = zero_mem::import_standard_allocation_memory(_init_structs, _ptr, _bytes_capacity);
 }
 
 void ZeroTensor::detach_imported_allocation_for_custom_tensor() {

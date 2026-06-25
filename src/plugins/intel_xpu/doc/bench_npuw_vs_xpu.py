@@ -59,7 +59,13 @@ def build():
         # pure stock GPU: full stateful LLM, GPU-managed internal KV. No NPUW props, no shared buffer.
         return core.compile_model(MODEL, "GPU")
     if MODE == "xpu":
-        return core.compile_model(MODEL, "XPU", kv_size)
+        props = dict(kv_size)
+        # A/B knob: XPU_ACTIVE_DEVICE=NPU -> pure-NPU prefill+decode but over the XPU SHARED HOST KV+weights
+        # (vs hybrid GPU-prefill). Isolates "shared host KV" from "GPU involvement" in the decode-speed gap.
+        ad = os.environ.get("XPU_ACTIVE_DEVICE")
+        if ad:
+            props["XPU_ACTIVE_DEVICE"] = ad
+        return core.compile_model(MODEL, "XPU", props)
     # native-int4 NPUW standalone (mirror the XPU plugin's NPU sub-compile, force int4-native)
     model = core.read_model(MODEL)
     props = {
@@ -118,6 +124,11 @@ def run(req, measure, prompt_ids, n_new):
               f"decode steady {st.mean(steady):.1f} ms/tok (min {min(per):.1f}, median {st.median(per):.1f}, "
               f"max {max(per):.1f})   ctx-growth: first{w} {head:.1f} -> last{w} {tail:.1f} ms/tok   "
               f"over {len(per)} toks (ctx {L}->{L+len(per)})   first_tok={first}", flush=True)
+        # Parseable profile: steady decode over the first 128 generated tokens vs the full run (skip first 6 = init).
+        base = per[6:] if len(per) > 6 else per
+        d128 = st.mean(per[6:128]) if len(per) >= 128 else st.mean(base)
+        print(f"  [{MODE}] PROFILE ctx={L} prefill_ms={pf:.0f} "
+              f"decode@128={d128:.1f} decode@{len(per)}={st.mean(base):.1f} ms/tok", flush=True)
     return pf, per
 
 # warm up (first-inference JIT for GPU) on one request, then measure fresh requests. Each measured iteration

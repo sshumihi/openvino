@@ -18,8 +18,8 @@ history, the one-copy proof, and the legacy DCOFF path).
 
 | | Pure GPU | Pure NPU | **XPU hybrid** |
 |---|---|---|---|
-| Prefill (first token) | 619 ms | 1982 ms | **660 ms** (= GPU compute) |
-| Decode (steady, ms/tok) | 69.3 | 92.4 | **90.4** (= NPU parity) |
+| Prefill (first token) | 602 ms | 2122 ms | **692 ms** (= GPU speed, 3.1x faster than NPU) |
+| Decode (steady, ms/tok) | 70 | 93 | **94** (= NPU parity) |
 | Weight copies in memory | 1 (GPU-resident) | 1 (NPU device bank) | **1** (7.31 GB, **shared** GPU+NPU) |
 | Process committed | n/a | n/a | **~9.8 GB** |
 
@@ -310,42 +310,58 @@ under unique random prompts (validity checks in 5.1).
 
 ## 5. Performance comparison
 
-Phi-4-14B, 1024-token prompt, 32 generated tokens:
+Phi-4-14B, all numbers re-measured fresh across 1k-8k context (`bench_npuw_vs_xpu.py {gpu|npuw|xpu} <ctx> 1024 1`,
+warm-up excluded, steady decode = mean after the 6th token). Prefill compares the **XPU hybrid vs stock GPU**
+(both prefill on the iGPU); decode compares the **XPU hybrid vs pure NPU** (the engine each path actually decodes
+on). Pure-GPU decode is shown only as a reference.
 
-| Config | Time-to-first-token (prefill) | Decode (steady ms/tok) | Decode throughput | Compile |
+**Prefill (time-to-first-token), seconds:**
+
+| Context | Stock GPU | **XPU hybrid** | Pure NPU | XPU/GPU | XPU vs NPU |
+|---|---|---|---|---|---|
+| 1k | 0.60 | **0.69** | 2.12 | 1.15x | **3.1x faster** |
+| 2k | 1.26 | **1.43** | 4.51 | 1.14x | **3.1x faster** |
+| 4k | 3.03 | **3.36** | 10.6 | 1.11x | **3.2x faster** |
+| 8k | 8.2 | **9.3** | 25.1 | 1.13x | **2.7x faster** |
+
+The hybrid prefills on the iGPU at ~GPU speed (1.1-1.15x; the small delta is the KV-write graph + orchestration)
+and **2.7-3.2x faster than the NPU's own prefill** - the absolute saving vs NPU grows from 1.4 s (1k) to 15.8 s
+(8k), so the hybrid's prefill advantage scales with context. (Prefill itself scales super-linearly - O(L^2)
+attention, ~14x time for 8x tokens - confirming real full-sequence compute, not a cache; §5.1.) The hybrid figure
+is end-to-end after the prefill optimizations of Appendix B.
+
+**Decode (steady ms/tok)**, measured over 1024 generated tokens. **decode@128 == decode@1024 to within ~1%** at
+every context: 14B decode is weight-bandwidth-bound (~7.3 GB streamed/token dwarfs the KV), so generating 128 vs
+1024 tokens barely moves the rate.
+
+| Context | **XPU hybrid** | Pure NPU | XPU vs NPU | (GPU ref) |
 |---|---|---|---|---|
-| **Pure GPU** (stock, GPU-managed KV) | **619 ms** | **69.3** | 14.4 tok/s | 7.7 s |
-| **Pure NPU** (standalone NPUW) | **1982 ms** | **92.4** | 10.8 tok/s | 101 s |
-| **XPU hybrid** (GPU prefill -> NPU decode) | **660 ms** | **90.4** | 11.1 tok/s | 15 s |
+| 1k | **94** | 93 | +1% (parity) | 70 |
+| 2k | **99** | 97 | +2% | 73 |
+| 4k | **115** | 109 | +5% | 78 |
+| 8k | **141** | 116 | +22% | 87 |
 
-**Prefill - the hybrid prefills at GPU speed.** Hybrid first-token (660 ms) is within ~7% of pure GPU (619 ms)
-and **3x faster than the NPU's own prefill (1982 ms)** - the GPU-prefill premise holds at 14B. The hybrid figure
-is end-to-end GPU compute after three optimizations (last-token logits slice, NPU-request reuse, compile-stage KV
-bind-cache; Appendix B).
+Hybrid decode (on the NPU, reading the shared KV) is at **parity with standalone NPU up to ~2k context**, then a
+penalty grows to **+22% at 8k** as the shared imported KV gets large (root cause + the two failed write-combined
+fix attempts in §5.2). Pure GPU decodes fastest (70-87 ms/tok) but **occupies the GPU**; the hybrid decodes on the
+NPU by design - to free the GPU and keep one shared weight copy.
 
-**Decode - NPU parity, no shared-buffer penalty.** Hybrid decode (90.4 ms/tok) matches standalone NPUW
-(92.4 ms/tok) to within noise: routing decode through the NPU while it reads the *shared* INT4 buffer costs
-nothing vs a private-weight NPUW model. Pure GPU decodes faster (69.3 ms/tok) but **occupies the GPU**; the hybrid
-decodes on the NPU by design - to free the GPU and keep one weight copy. (Decode for a 14B model streams ~3.5x the
-weight bytes per token of a 4B model, hence ~90 vs ~36 ms/tok on Qwen3-4B.)
+**Compile:** hybrid **~15 s** vs pure-NPU standalone **~100-160 s** (the hybrid skips the NPU prefill-model
+compile - aliased to generate, 3.3.1 - and partitions only the decode path).
 
-**Compile.** The hybrid compiles in **15 s** vs the pure-NPU standalone's **101 s**: the hybrid skips the NPU
-prefill-model compile (aliased to generate, 3.3.1) and partitions only the decode path.
+**Net.** The hybrid wins decisively on prefill at every length (GPU-speed, ~3x the NPU, advantage growing with
+context) and matches NPU decode through ~2k; beyond that the long-context decode tax accumulates (break-even vs
+pure NPU ~640 output tokens at 8k). So it is strongest for **long-prompt / short-to-moderate-output** workloads
+(RAG, summarization, extraction, classification) while keeping decode - and its power draw - off the GPU.
 
 ### 5.1 Validity: prefill scales with sequence length, and no prefix cache is active
 The §5 figures are at **1024 tokens**. Two checks confirm they reflect real compute, not a cache:
 
-**(a) Prefill scales super-linearly with prompt length** (pure GPU, Phi-4, fixed prompt):
-
-| Prompt tokens | 1024 | 2048 | 4096 | 8192 |
-|---|---|---|---|---|
-| GPU prefill | 0.61 s | 1.26 s | 3.09 s | **10.1 s** |
-| vs 1K | 1.0x | 2.1x | 5.1x | **16.6x** |
-
-8x the tokens -> ~17x the time, because attention is O(L^2) - the exact signature of full attention over all
-positions. A length-independent short-circuit or a content cache would be flat/sub-linear. So **~0.6 s is the
-1024-token prefill**; an 8192-token prefill is ~10 s (the hybrid is ~9.7 s, same GPU engine). A 14B 8K prefill in
-0.6 s would indeed be impossible - measured, it is 10 s.
+**(a) Prefill scales super-linearly with prompt length** (the §5 prefill table): GPU 0.60 -> 1.26 -> 3.03 -> 8.2 s
+for 1k -> 8k = **~14x for 8x tokens** (attention is O(L^2)). A length-independent short-circuit or a content cache
+would be flat/sub-linear; the super-linear growth is the signature of real full-sequence compute. (The 8k prefill
+shows ~8-11 s run-to-run thermal variance on the iGPU under sustained load; 8.2 s is the cool first-iteration
+value.) A 14B 8k prefill in 0.6 s would be impossible - measured, it is ~8 s.
 
 **(b) No prefix/prompt cache is active.** NPUW ships a prefix-caching feature (`PrefixCacheManager`,
 hash-of-prompt-tokens block reuse) but it is **default-off** (`NPUW_LLM_ENABLE_PREFIX_CACHING=false`),
@@ -362,59 +378,40 @@ cache): prefill is **unchanged** vs the fixed prompt -
 A content-keyed cache would make the *repeated* prompt far faster; it does not. (`first_tok` also varies with the
 unique prompt and with length - 68 at 1K, 365 at 2K, 877 at 4K, 13 at 8K - confirming real per-prompt compute.)
 
-### 5.2 Long context (8192-token prompt): prefill advantage grows, a decode tradeoff appears
-The §5 table is at 1K, where prefill and decode are both modest. At **8K** the hybrid's split shows its true
-shape - the prefill advantage gets much larger, and a decode tradeoff surfaces.
+### 5.2 The long-context decode gap: root-cause investigation
+The §5 decode comparison shows the hybrid at **parity with standalone NPU up to ~2K context** (94 vs 93 ms/tok at
+1K), with a penalty that grows purely with KV size to **~22% at 8K** (141 vs 116 ms/tok). Why?
 
-**Prefill @8K (8192-token prompt)** - `bench {gpu|xpu|npuw} 8192 ...`:
+The decode generate model is byte-for-byte identical between the two paths, both KV buffers live in host memory
+(the NPU backend has no device-memory path - all I/O is `zeMemAllocHost`), and neither does a per-token copy - so
+it is not the model, not device-vs-host, not a staging copy. The one code-level difference is the KV **allocation
+attribute**: the NPU tags its own input tensors (incl. the native KV) with
+`ZE_HOST_MEM_ALLOC_FLAG_BIAS_WRITE_COMBINED`, while the XPU shared KV is an *externally imported* `_aligned_malloc`
+(`zeMemAllocHost` + `ze_external_memmap_sysmem`) that imports without it. That made write-combined (WC) the natural
+hypothesis - **but two experiments refuted it:**
 
-| | Pure GPU | XPU hybrid | Pure NPU |
-|---|---|---|---|
-| prefill @8K | **8.3 s** | **9.0 s** | **25.0 s** |
+- **Attempt 1 - WC-on-import (no effect, 131 ms/tok).** Threading `is_input=true` so the shared KV imports with
+  `ZE_HOST_MEM_ALLOC_FLAG_BIAS_WRITE_COMBINED` changed nothing - the WC bias on `ze_external_memmap_sysmem` of an
+  existing `_aligned_malloc` is a no-op (a page's cache type is fixed at allocation; importing already-cached
+  pages with a WC hint does not convert them, and being ignored it raised no aliasing issue).
+- **Attempt 2 - WC allocation (catastrophic, 3135 ms/tok = 23x SLOWER).** Allocating the KV as genuinely
+  write-combined (`VirtualAlloc(PAGE_WRITECOMBINE)`, imported WC into both contexts; prefill and token output
+  intact) made decode **23x slower**. WC/uncached memory is optimized for writes and is terrible for *reads* - the
+  NPU's per-token KV attention re-reads the whole KV, so uncached reads are disastrous.
 
-The hybrid prefills at ~GPU speed (1.1x) and **2.7x faster than the NPU's own prefill**. The absolute saving vs
-pure NPU is **~16 s at 8K** (vs ~1.3 s at 1K): the GPU-prefill advantage **scales with context** - this is the
-whole point of the hybrid for long prompts. (GPU @8K prefill is ~8-10 s run-to-run, cf. the cold-scaling ~10 s in
-5.1; 9.0 s is the warmed hybrid mean.)
-
-**Decode under 8K context (1024 output tokens, context 8192 -> 9216)** - `bench {xpu|npuw} 8192 1024 1`:
-
-| | XPU hybrid | Pure NPU |
-|---|---|---|
-| decode @8K ctx | **140 ms/tok** | **115 ms/tok** |
-
-Both are nearly flat across 8192->9216 (first64 -> last64 within a few %; 14B decode is weight-bandwidth-bound, so
-+1024 tokens of KV barely move it). But unlike the **parity at 1K context** (hybrid 90 vs NPU 92 ms/tok), at 8K
-the **hybrid decode is ~22% slower** than standalone NPU. The gap is purely KV-scaling (zero at 1K, growing with
-KV size: hybrid +~7 ms/tok per 1K context vs NPU +~3).
-
-**Root cause (identified).** The decode generate model is byte-for-byte identical between the two paths
-(confirmed), both KV buffers live in host memory, and neither does a per-token copy - so it is not the model,
-not device-vs-host, and not a staging copy. The one remaining difference is the KV **allocation attribute**: the
-NPU backend tags its own input tensors (incl. the native KV) with `ZE_HOST_MEM_ALLOC_FLAG_BIAS_WRITE_COMBINED`
-(`is_input=true`), whereas the XPU shared KV is an *externally imported* `_aligned_malloc` (`zeMemAllocHost` +
-`ze_external_memmap_sysmem`) that imports with `is_input=false` -> **no write-combined bias**. Non-WC (cached)
-host memory makes the NPU DMA snoop CPU caches for coherency; this is amortized for the **sequential** weight
-stream (hence 1K-context parity, where decode is weight-bound) but is the plausible cost for the **strided**
-attention reads of a large transposed-V KV (hence the 8K penalty).
-
-**Fix attempt 1 - WC-on-import (ineffective).** Threading `is_input=true` through the NPU backend's user-tensor
-import so the shared KV is imported with `ZE_HOST_MEM_ALLOC_FLAG_BIAS_WRITE_COMBINED` left decode **unchanged**
-(131 ms/tok, token output intact). Reason: the WC bias on `ze_external_memmap_sysmem` of an existing
-`_aligned_malloc` is a no-op - a page's cache type is fixed at allocation, so importing already-cached (WB) pages
-with a WC hint does not convert them (and, because it is ignored, it raises no WB/WC aliasing issue). A genuine
-test/fix must **allocate the shared KV as WC from the start** (e.g. Windows `VirtualAlloc(PAGE_WRITECOMBINE)`)
-then import into both contexts - then both engines map genuinely-WC pages. That is the remaining lever (the KV is
-device-written by the GPU and device-read by the NPU, with negligible CPU access, so WC is acceptable for it),
-and would also definitively confirm/refute the WC hypothesis - **not yet done**. (A separate
-`XPU_ACTIVE_DEVICE=NPU` A/B was inconclusive: that mode keeps the NPU prefill model resident and has its own ~4x
-weight-read regression, unrelated to the KV.)
+**Conclusion: WC is not the cause and not the fix.** The imported (cached, write-back) KV is already the right
+memory type for reads; the native KV's modest ~14% edge comes from something else (candidates not yet pinned:
+the IOMMU/MMU mapping of a single large *imported external* region, or the same pages being co-mapped/written by
+the GPU context - TLB/coherency effects - vs a fresh NPU-local allocation). The payoff (~14-22% decode at long
+context) is small and the sub-cause is deep, so this is left as a known long-context tradeoff rather than chased
+further; the experimental WC code was reverted. (A separate `XPU_ACTIVE_DEVICE=NPU` A/B was also inconclusive:
+that mode keeps the NPU prefill model resident and has its own ~4x weight-read regression, unrelated to the KV.)
 
 **Net end-to-end (1024-token generation @8K).** Prefill saving (hybrid vs pure NPU) ~16 s; decode penalty
 ~25 ms/tok. Break-even is **~640 output tokens**: below it the hybrid is faster end-to-end than pure NPU, above it
 pure NPU edges ahead. So the hybrid is strongest for **long-prompt, short-to-moderate-output** workloads (RAG,
 summarization, extraction, classification) - exactly the long-context regime - while keeping decode off the GPU.
-(Pure GPU is fastest end-to-end - ~8.3 s + ~89 ms/tok - but occupies the GPU; freeing it is the hybrid's reason
+(Pure GPU is fastest end-to-end - ~8.2 s + ~87 ms/tok - but occupies the GPU; freeing it is the hybrid's reason
 to exist.)
 
 ## 6. NPU / GPU memory breakdown (XPU hybrid)
@@ -529,7 +526,7 @@ prompt_len`. The bench auto-sizes from its `prompt_len`/`max_new` args.
 ## B. Optimizations done
 
 The prefill path went **first-token ~1333 ms (CPU bridge) -> ~700 (KV-write) -> ~420 (NPU-request reuse) ->
-~230 ms (logits slice)** on Qwen3-4B (the same levers give Phi-4's 660 ms @14B). Decode went **150 -> ~36 ms/tok**
+~230 ms (logits slice)** on Qwen3-4B (the same levers give Phi-4's ~690 ms @14B @1K). Decode went **150 -> ~36 ms/tok**
 (Qwen) via the bank raw-share (3.1.3). The three prefill levers, in order of impact:
 
 ### B.1 KV-output binding moved to compile (small, but correct)
