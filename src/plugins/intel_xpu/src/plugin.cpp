@@ -15,6 +15,7 @@
 #include "compiled_model.hpp"
 #include "openvino/core/graph_util.hpp"
 #include "openvino/core/rt_info.hpp"
+#include "openvino/core/rt_info/weightless_caching_attributes.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/broadcast.hpp"
 #include "openvino/op/constant.hpp"
@@ -290,6 +291,12 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model(const std::filesystem:
                 c->get_element_type(), c->get_shape(), buf->host_ptr, so);
             new_c->set_friendly_name(c->get_friendly_name());
             ov::copy_runtime_info(c, new_c);
+            // WeightlessCacheAttribute::is_copyable()==false, so copy_runtime_info drops it. Without it,
+            // NPUW's Const wrapper (lazy_tensor.cpp) treats every relocated weight as a "new Constant not
+            // in the weights file" and eagerly copies it to host (~2.1 GB second copy at partition time).
+            // The relocated buffer is a verbatim memcpy of .bin[bin_offset], so preserving the attr is
+            // correct (and keeps weightless caching valid).
+            ov::copy_weightless_cache_attr(c, new_c);
             ov::replace_node(c, new_c);
             if (!rs.str().empty()) rs << ";";
             rs << reinterpret_cast<uint64_t>(buf->host_ptr) << ":" << buf->alloc_size;

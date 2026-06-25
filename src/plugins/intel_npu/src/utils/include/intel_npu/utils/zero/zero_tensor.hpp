@@ -40,8 +40,13 @@ public:
      * imported in that context ( to be implemented). ZeroTensor will keep a reference to the source tensor.
      * @param init_structs Shared pointer to ZeroInitStructsHolder
      * @param user_tensor Tensor to create ZeroTensor from
+     * @param is_input Indicates if the tensor is used as a network input (true) or output (false). Inputs are
+     *                 imported with ZE_HOST_MEM_ALLOC_FLAG_BIAS_WRITE_COMBINED (matching the allocate path), which
+     *                 makes the NPU DMA read them without CPU-cache snooping - important for large imported KV.
      */
-    ZeroTensor(const std::shared_ptr<ZeroInitStructsHolder>& init_structs, const ov::SoPtr<ov::ITensor>& user_tensor);
+    ZeroTensor(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
+               const ov::SoPtr<ov::ITensor>& user_tensor,
+               const bool is_input = false);
 
     void* data() override;
     void* data(const ov::element::Type& type) override;

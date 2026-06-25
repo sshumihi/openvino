@@ -518,8 +518,9 @@ void ZeroInferRequest::sync_zero_tensor_with_graph(const ZeroInferRequest::Found
             OV_ITT_TASK_NEXT(ZERO_SET_TENSOR, "create zero tensor");
 
             // Try to use the user tensor directly if its underlying data is already allocated in the same Level Zero
-            // context.
-            levelZeroTensor = std::make_shared<ZeroTensor>(_initStructs, tensor);
+            // context. Pass is_input so an imported input (e.g. the XPU shared KV) gets the write-combined bias,
+            // matching the allocate path and avoiding CPU-cache snooping on the NPU's large KV attention reads.
+            levelZeroTensor = std::make_shared<ZeroTensor>(_initStructs, tensor, foundPort.is_input());
             updateCommandListArg = true;
         } catch (const ZeroMemException& exception) {
             _logger.debug("sync_zero_tensor_with_graph - exception caught while trying to create a "
@@ -637,7 +638,8 @@ void ZeroInferRequest::sync_zero_tensors_with_graph(const ZeroInferRequest::Foun
                 try {
                     _logger.debug("sync_zero_tensors_with_graph - create zero tensor");
                     OV_ITT_TASK_NEXT(ZERO_SET_TENSORS, "create zero tensor");
-                    get_level_zero_input(foundPort.idx, i) = std::make_shared<ZeroTensor>(_initStructs, tensors.at(i));
+                    get_level_zero_input(foundPort.idx, i) =
+                        std::make_shared<ZeroTensor>(_initStructs, tensors.at(i), /*is_input=*/true);
                 } catch (const ZeroMemException& exception) {
                     _logger.debug(
                         "sync_zero_tensors_with_graph - exception caught while trying to create a Level Zero tensor "
