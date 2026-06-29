@@ -342,8 +342,10 @@ every context: 14B decode is weight-bandwidth-bound (~7.3 GB streamed/token dwar
 | 8k | **141** | 116 | +22% | 87 |
 
 Hybrid decode (on the NPU, reading the shared KV) is at **parity with standalone NPU up to ~2k context**, then a
-penalty grows to **+22% at 8k** as the shared imported KV gets large (root cause + the two failed write-combined
-fix attempts in §5.2). Pure GPU decodes fastest (70-87 ms/tok) but **occupies the GPU**; the hybrid decodes on the
+penalty grows to **+22% at 8k**, which §5.2 decomposes: **~60% GPU-prefill thermal/power coupling** (measured -
+cooldown recovers ~17 ms/tok) **+ ~40% a KV-scaling residual** whose mechanism resisted both a WC-import and a
+detach-churn fix (real-kernel A/B isolated a 3.4x custom-tensor effect that did not transfer to full decode). It is
+*not* import-fallback and *not* linear copy-BW. Pure GPU decodes fastest (70-87 ms/tok) but **occupies the GPU**; the hybrid decodes on the
 NPU by design - to free the GPU and keep one shared weight copy.
 
 **Compile:** hybrid **~15 s** vs pure-NPU standalone **~100-160 s** (the hybrid skips the NPU prefill-model
@@ -382,12 +384,11 @@ unique prompt and with length - 68 at 1K, 365 at 2K, 877 at 4K, 13 at 8K - confi
 The §5 decode comparison shows the hybrid at **parity with standalone NPU up to ~2K context** (94 vs 93 ms/tok at
 1K), with a penalty that grows purely with KV size to **~22% at 8K** (141 vs 116 ms/tok). Why?
 
-The decode generate model is byte-for-byte identical between the two paths, both KV buffers live in host memory
-(the NPU backend has no device-memory path - all I/O is `zeMemAllocHost`), and neither does a per-token copy - so
-it is not the model, not device-vs-host, not a staging copy. The one code-level difference is the KV **allocation
-attribute**: the NPU tags its own input tensors (incl. the native KV) with
+The decode generate model is byte-for-byte identical between the two paths, and both KV buffers live in host
+memory (the NPU backend has no device-memory path - all I/O is `zeMemAllocHost`). The one code-level difference is
+the KV **host-memory attribute**: the NPU's own input tensors are tagged
 `ZE_HOST_MEM_ALLOC_FLAG_BIAS_WRITE_COMBINED`, while the XPU shared KV is an *externally imported* `_aligned_malloc`
-(`zeMemAllocHost` + `ze_external_memmap_sysmem`) that imports without it. That made write-combined (WC) the natural
+(`zeMemAllocHost` + `ze_external_memmap_sysmem`) imported without it. That made write-combined (WC) the natural
 hypothesis - **but two experiments refuted it:**
 
 - **Attempt 1 - WC-on-import (no effect, 131 ms/tok).** Threading `is_input=true` so the shared KV imports with
@@ -399,13 +400,101 @@ hypothesis - **but two experiments refuted it:**
   intact) made decode **23x slower**. WC/uncached memory is optimized for writes and is terrible for *reads* - the
   NPU's per-token KV attention re-reads the whole KV, so uncached reads are disastrous.
 
-**Conclusion: WC is not the cause and not the fix.** The imported (cached, write-back) KV is already the right
-memory type for reads; the native KV's modest ~14% edge comes from something else (candidates not yet pinned:
-the IOMMU/MMU mapping of a single large *imported external* region, or the same pages being co-mapped/written by
-the GPU context - TLB/coherency effects - vs a fresh NPU-local allocation). The payoff (~14-22% decode at long
-context) is small and the sub-cause is deep, so this is left as a known long-context tradeoff rather than chased
-further; the experimental WC code was reverted. (A separate `XPU_ACTIVE_DEVICE=NPU` A/B was also inconclusive:
-that mode keeps the NPU prefill model resident and has its own ~4x weight-read regression, unrelated to the KV.)
+WC was a dead end. The next hypothesis - that the *hybrid* pays a per-token KV copy because its packed sub-tensor
+slices fail the NPU's 4096-aligned zero-copy *import* and fall back to `allocate_tensor` + copy - was **also
+disproven**, by instrumenting the import path itself (`ZeroTensor`, logging every tensor whose pointer or size is
+not page-aligned, i.e. every import that *will* fall back):
+
+- **The hybrid's big KV slots never fall back.** The shared KV buffer is imported into the NPU L0 context *as one
+  whole `_aligned_malloc`* (the same dual-import as the weights, §1.1). When each per-layer slice (`kv_base+offset`)
+  is synced, `import_standard_allocation_memory` finds it *inside* that existing whole-buffer import and
+  **pool-hits** it - no per-slice import, no fallback, no copy. The hybrid KV *is* genuinely zero-copy on the NPU
+  side. (The "import the whole buffer once so the slices pool-hit" idea once floated as the *fix* turns out to be
+  already the operating mechanism.)
+- **Pure NPU falls back *more*, yet is *faster*.** In the standalone path each KV slot is the request's own tensor,
+  not part of a pre-imported whole buffer, so every slot fails the page-align import (`[1,10,8319,128]`,
+  `21296640 % 4096 = 1536`) and is **copied into a private native-L0 buffer** - 240 big-KV fallbacks plus ~2700
+  weight-scale fallbacks in the same 8K run, vs the hybrid's **zero** big-KV fallbacks. Pure NPU does strictly more
+  import-fallback copying than the hybrid and still decodes faster, so the import fallback cannot be the regression.
+- **The fallbacks that *do* occur (in both paths) are small, intrinsic tensors** - per-token present-KV
+  `[1,10,1,128]` (2560 B), hidden states `[1,1,5120]` (10240 B), per-weight scale vectors - whose byte sizes are
+  simply not 4096-multiples. They are identical in kind between the paths (the hybrid has *fewer*), and no
+  KV-layout / `total_size` padding can align them (a `total_size` pad only *shifts* which set is misaligned -
+  confirmed by experiment). The earlier "644 per-token fallbacks → ~1.9 GB/token copy" claim was a
+  **misattribution**: those 644 are these small tensors (tens of MB/token, common to both paths), **not** a
+  full-slot KV copy. The page-align fix built on it was reverted.
+
+**Hypothesis - KV memory *type*, not a copy.** With the import-fallback theory eliminated, the remaining
+code-level difference is *where the resident KV physically lives* for the per-token attention read: pure NPU's
+import-fallback *stages* each KV slot into a **native-L0 host allocation** (`zeMemAllocHost`), whereas the hybrid
+keeps the KV in an **externally-imported `_aligned_malloc`** (plain cached sysmem) and the NPU re-reads it every
+token. If native-L0 host memory had higher NPU read bandwidth than imported sysmem-malloc, that would scale with KV
+volume and match the observed parity-to-+22% shape. This was the leading hypothesis - **so it was tested directly.**
+
+**Standalone L0 bandwidth UT (`C:/yqiu/npu_bw_ut/`, 2026-06-29) - REFUTES the read-bandwidth form.** A pure
+Level-Zero microbenchmark (no OpenVINO, no NPU blob) replicates the backend's two exact allocation paths -
+native `zeMemAllocHost` and imported `_aligned_malloc` + `ze_external_memmap_sysmem_ext_desc_t` (`zero_mem.cpp:13-73`)
+- each with/without the `WRITE_COMBINED` bias, then times the NPU copy engine (`zeCommandListAppendMemoryCopy`)
+reading each. Result, robust across 64/200/512 MiB:
+
+| KV buffer kind (real-world) | NPU linear READ | linear WRITE |
+|---|---|---|
+| NATIVE + WC  (pure-NPU KV) | **33.0 GB/s** | 32.9 |
+| IMPORTED + noWC (hybrid KV) | **32.9 GB/s** | 31.9 |
+
+Native vs imported read bandwidth is **at parity (within ±1%)**; the import mechanism costs ~0, and the
+`WRITE_COMBINED` bias affects only *writes* (+small), not reads. So for **linear/sequential** access the two buffer
+kinds are bandwidth-identical on the NPU - the simple "imported memory is slower to read" explanation is **refuted.**
+(This also reconciles the old WC result: `zeMemAllocHost(BIAS_WRITE_COMBINED)` is a benign driver *hint*, unlike the
+catastrophic strict-uncached `VirtualAlloc(PAGE_WRITECOMBINE)` of the earlier experiment.)
+
+**Thermal / power-budget coupling - CONFIRMED as the dominant contributor (~60% of the gap).** The hybrid decodes
+*immediately after* a 9 s GPU prefill burn on the same package; pure-NPU decode follows a cool-GPU NPU prefill.
+Inserting an idle cooldown between prefill and the measured decode (`bench_npuw_vs_xpu.py --cooldown N`) isolates it:
+
+| @8K decode (ms/tok) | cooldown 0 | 30 s | 60 s |
+|---|---|---|---|
+| **hybrid** | 142.6 | 127.7 | 125.8 |
+| **pure NPU (control)** | 113.2 | 113.5 | - |
+
+Pure-NPU decode is **cooldown-insensitive** (113.2 -> 113.5) - no preceding GPU activity - while the hybrid
+**recovers ~17 ms/tok** as the GPU power-gates during the idle and returns the shared package power/thermal budget to
+the NPU. So **~60% of the ~29 ms/tok hot gap is GPU-prefill thermal coupling, not a memory effect.** Longer/hotter
+prefill at larger context => more accumulated heat => more decode throttle, which is exactly the parity-at-1k ->
++22%-at-8k shape. (Mechanism is power-budget sharing on the LNL/PTL package, not a transient: cooled hybrid decode is
+flat across 256 tokens, and the cooldown floor is reached by ~30-60 s.) This is inherent to running both engines on
+one package back-to-back; it is not a code bug. A "fix" trades latency (idle the GPU before decode) and only pays off
+for long generations.
+
+**Residual ~12 ms/tok (cooled hybrid 125.8 vs pure NPU 113.2): KV-related, mechanism OPEN.** It scales with context
+(parity at 1k, ~12 ms at 8k), so it tracks the KV. A real-kernel A/B (`C:/yqiu/npu_kernel_ab/`: a read-bound
+`MatMul(x[1,10,S,128], w[128,1])` on the NPU, x bound four ways, same pure-NPU infer - no thermal confound) found a
+real microkernel effect:
+
+| x binding (200 MB) | NPU kernel read |
+|---|---|
+| native `get_tensor` (WC) | 67 GB/s |
+| imported `CPU_VA`, INPUT (WC, stable remote tensor) | 74 GB/s |
+| imported `set_tensor` malloc (non-WC, **custom user tensor**) | **19.6 GB/s** |
+
+i.e. a *custom* imported tensor (plain `make_tensor`/`set_tensor` over a raw ptr - the hybrid's KV binding) reads
+3.4x slower in this microkernel than a native or stable-remote tensor. **But two fixes derived from it were
+implemented and validated INEFFECTIVE on real cooled decode:**
+- **WC import** (thread `is_input=true` so imported inputs get the WC bias like native inputs): cooled decode 127.4
+  vs 125.8 - no change.
+- **Skip the per-token detach** (`detach_imported_allocation_for_custom_tensor`, which frees+re-imports custom
+  inputs every infer): cooled decode 127.2 vs 128.5 - no change.
+
+So the microbench's 3.4x custom-vs-stable gap **does not transfer** to full decode - the KV is a small fraction of
+the ~7.3 GB/token weight stream (which reads fast either way), so even an 8 ms isolated KV-read penalty is mostly
+hidden, and neither the WC bias nor eliminating the re-import churn moved the needle. The residual is real and
+KV-scaling but its full-pipeline mechanism is **not pinned**; both code fixes were reverted to the clean baseline.
+
+**Net: the long-context decode gap is ~60% GPU-prefill thermal coupling (measured, the actionable part) + ~40% a
+KV-scaling residual whose mechanism resisted the WC and detach fixes.** It is definitively *not* import-fallback,
+*not* linear copy-BW, *not* (fixable-by) WC, *not* the detach churn. (The `XPU_ACTIVE_DEVICE=NPU` A/B was
+inconclusive - that mode keeps the NPU prefill model resident with its own ~4x weight-read regression, unrelated.
+All experimental WC, detach, and page-align code was reverted; the shipping path is the clean baseline.)
 
 **Net end-to-end (1024-token generation @8K).** Prefill saving (hybrid vs pure NPU) ~16 s; decode penalty
 ~25 ms/tok. Break-even is **~640 output tokens**: below it the hybrid is faster end-to-end than pure NPU, above it
