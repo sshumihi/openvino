@@ -84,4 +84,10 @@ class ZeroMemException final : public std::runtime_error {
 public:
     explicit ZeroMemException(const std::string& msg) : std::runtime_error(msg) {}
 };
+
+// Diagnostic counters: number of real Level Zero host-memory syscalls performed via ZeroMem.
+// Pool hits reuse an existing allocation and do NOT construct a ZeroMem, so these count only
+// genuine zeMemAllocHost (alloc) / import calls. Used to probe per-token weight re-import.
+uint64_t zero_mem_alloc_count();
+uint64_t zero_mem_import_count();
 }  // namespace intel_npu

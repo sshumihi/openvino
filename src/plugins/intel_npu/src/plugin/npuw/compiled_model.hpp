@@ -347,6 +347,12 @@ private:
     std::function<bool(const ov::SoPtr<ov::ITensor>&, const ov::SoPtr<ov::ITensor>&)> m_acc_check;
     std::string m_ref_device;
 
+    // XPU hybrid shared weights: the serialized "ptr:size;..." ranges captured from the source model's
+    // rt_info "xpu_shared_weight_ranges". Re-applied onto each GPU submodel in compile_submodel() so the
+    // intel_gpu plugin's constant op can zero-copy (share_usm) the relocated weights. Empty unless the
+    // XPU_HYBRID_SHARED_WEIGHTS path tagged the model.
+    std::string m_xpu_shared_weight_ranges;
+
     execution_stats m_total_stat;
 
     std::shared_ptr<weights::Bank> m_weights_bank = nullptr;

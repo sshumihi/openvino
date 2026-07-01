@@ -385,6 +385,14 @@ ov::npuw::CompiledModel::CompiledModel(const std::shared_ptr<ov::Model>& model,
     // Note: we need to identify original bf16 constants for potential weightless deserialization later
     // And only then do bf16 to f16 transformation
     m_bf16_consts = ov::npuw::s11n::get_bf16_consts(model);
+
+    // XPU hybrid shared weights: capture the shared-buffer ranges tag before partitioning. NPUW builds
+    // each subgraph as a fresh ov::Model that does NOT inherit this rt_info, so we re-apply it per GPU
+    // submodel in compile_submodel().
+    if (model->has_rt_info("xpu_shared_weight_ranges")) {
+        m_xpu_shared_weight_ranges = model->get_rt_info<std::string>("xpu_shared_weight_ranges");
+    }
+
     pre_load_transform(model, properties);
 
     ::intel_npu::registerNPUWOptions(*m_options_desc);
@@ -1688,6 +1696,8 @@ void ov::npuw::CompiledModel::finalize_weights_bank() {
             const auto real_idx = comp_model_desc.replaced_by.value_or(idx);
             auto& desc_closure = comp_model_desc.closure.unsafe_get();
 
+            size_t dbg_wrapped = 0, dbg_gpu_closures = 0;
+            const auto dbg_dev = submodel_device(real_idx);
             for (std::size_t tidx = 0; tidx < desc_closure.closure.size(); ++tidx) {
                 if (desc_closure.closure[tidx]) {
                     // host-side closure - already set, do nothing
@@ -1697,8 +1707,26 @@ void ov::npuw::CompiledModel::finalize_weights_bank() {
                 const auto& uid = desc_closure.closure_uid[tidx];
                 NPUW_ASSERT(uid != -1);  // All tensors should be registered at this point
                 desc_closure.closure[tidx] = m_weights_bank->get(uid, submodel_device(real_idx));
+                // XPU dual-L0 shared weights: if this closure is a host view of the shared malloc and
+                // this submodel runs on the GPU, wrap it as a zero-copy GPU USM remote tensor so the GPU
+                // reads the shared buffer in place instead of copying it into device memory. No-op otherwise.
+                bool gpu_usm_wrapped = false;
+                if (ov::npuw::util::starts_with(dbg_dev, "GPU")) {
+                    ++dbg_gpu_closures;
+                }
+                desc_closure.closure[tidx] = m_weights_bank->wrap_gpu_usm_if_resident(desc_closure.closure[tidx],
+                                                                                     submodel_device(real_idx),
+                                                                                     gpu_usm_wrapped);
+                if (gpu_usm_wrapped) {
+                    ++dbg_wrapped;
+                }
                 // FIXME: find a more reliable way to do so
-                desc_closure.is_remote[tidx] = m_weights_bank->is_remote(uid);
+                desc_closure.is_remote[tidx] = m_weights_bank->is_remote(uid) || gpu_usm_wrapped;
+            }
+            if (ov::npuw::util::starts_with(dbg_dev, "GPU") || dbg_wrapped) {
+                ::ov::npuw::xpu_dbg() << "[NPUW] finalize: submodel " << idx << " dev=" << dbg_dev
+                                      << " gpu_closures=" << dbg_gpu_closures
+                                      << " gpu_usm_wrapped=" << dbg_wrapped << std::endl;
             }
         }
 
@@ -2211,6 +2239,17 @@ ov::SoPtr<ov::ICompiledModel> ov::npuw::CompiledModel::compile_submodel(const st
                           << " " << node->get_output_partial_shape(0) << std::endl;
             }
         }
+    }
+
+    // XPU hybrid shared weights: re-apply the shared-buffer ranges tag onto GPU submodels so the
+    // intel_gpu plugin's constant op recognizes the relocated weight pointers and zero-copies them
+    // via share_usm instead of allocating a device copy. The freshly-extracted subgraph model does
+    // not inherit the parent model's rt_info, so it must be set here.
+    if (ov::npuw::util::starts_with(device, "GPU") && !m_xpu_shared_weight_ranges.empty()) {
+        submodel->set_rt_info(m_xpu_shared_weight_ranges, "xpu_shared_weight_ranges");
+        ::ov::npuw::xpu_dbg() << "[NPUW compile_submodel] " << submodel->get_friendly_name()
+                  << " tagged xpu_shared_weight_ranges (" << m_xpu_shared_weight_ranges.size()
+                  << " chars) for GPU zero-copy" << std::endl;
     }
 
     return core->compile_model(submodel, device, device_config);

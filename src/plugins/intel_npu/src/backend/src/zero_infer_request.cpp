@@ -9,6 +9,7 @@
 #include "intel_npu/prefix.hpp"
 #include "intel_npu/utils/utils.hpp"
 #include "intel_npu/utils/zero/zero_api.hpp"
+#include "intel_npu/utils/zero/zero_mem.hpp"
 #include "intel_npu/utils/zero/zero_remote_tensor.hpp"
 #include "intel_npu/utils/zero/zero_utils.hpp"
 #include "openvino/op/util/op_types.hpp"
@@ -1121,6 +1122,14 @@ void ZeroInferRequest::get_result() {
                 levelZeroTensor->detach_imported_allocation_for_custom_tensor();
             }
         }
+    }
+
+    if (std::getenv("XPU_IMPORT_COUNT")) {
+        fprintf(stderr,
+                "[IMPORT-COUNT] token: l0_host_allocs=%llu l0_host_imports=%llu\n",
+                static_cast<unsigned long long>(zero_mem_alloc_count()),
+                static_cast<unsigned long long>(zero_mem_import_count()));
+        fflush(stderr);
     }
 
     OV_ITT_TASK_NEXT(ZERO_RESULT, "reset");

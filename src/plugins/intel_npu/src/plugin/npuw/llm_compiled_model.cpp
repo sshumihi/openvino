@@ -46,10 +46,14 @@
 #include "partitioning/patterns/pre_compute.hpp"
 #include "partitioning/patterns/sdpa.hpp"
 #include "serialization.hpp"
+#include "shared_weight_buffer.hpp"
 #include "transformations/convert_precision.hpp"
 #include "util.hpp"
 #include "whisper/prepare_whisper_model.hpp"
 #include "whisper/whisper_infer_request.hpp"
+#include "openvino/core/graph_util.hpp"
+#include "openvino/core/rt_info.hpp"
+#include "openvino/core/rt_info/weightless_caching_attributes.hpp"
 
 namespace opp = ov::pass::pattern;
 
@@ -711,6 +715,93 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     ov::AnyMap other_props;
     split_llm_properties(properties, npuw_llm_props, other_props);
     const auto npudesc = extract_npu_descriptor(plugin, other_props);
+
+    // XPU hybrid shared weights (NPUW-native port of the intel_xpu mechanism, CVS-189549):
+    // when XPU_HYBRID_SHARED_WEIGHTS is set, relocate every large weight Constant into ONE page-aligned
+    // host buffer that is dual-L0-imported into the GPU and NPU contexts. Both the GPU prefill submodel
+    // (share_usm) and the NPU decode submodel (native-INT4 import + bank zero-copy view) then read the
+    // SAME physical bytes instead of each allocating its own ~2 GB copy. Must run BEFORE the model is
+    // cloned into prefill/generate submodels so all clones inherit the relocated (shared) Constants.
+    if (properties.find("XPU_HYBRID_SHARED_WEIGHTS") != properties.end()) {
+        ov::SoPtr<ov::IRemoteContext> gpu_ctx;
+        try {
+            gpu_ctx = plugin->get_core()->get_default_context("GPU");
+        } catch (const std::exception& e) {
+            LOG_WARN("[NPUW] XPU_HYBRID_SHARED_WEIGHTS: GPU context unavailable (" << e.what()
+                     << "); weights will NOT be shared (GPU copies).");
+        }
+        // NPU-L0 context: import each shared buffer ONCE and hold it so the per-token decode weight
+        // import is a mem-pool HIT (no zeMemAllocHost/token). Without this the NPU re-imports every
+        // shared weight on every decode token (~4.5x decode regression vs the non-shared baseline).
+        ov::SoPtr<ov::IRemoteContext> npu_ctx;
+        try {
+            npu_ctx = plugin->get_core()->get_default_context("NPU");
+        } catch (const std::exception& e) {
+            LOG_WARN("[NPUW] XPU_HYBRID_SHARED_WEIGHTS: NPU context unavailable (" << e.what()
+                     << "); NPU decode will re-import shared weights per token.");
+        }
+        constexpr size_t kMinRelocateBytes = 4096;  // page-sized+; skip tiny scalar constants
+        std::ostringstream rs;
+        size_t total_bytes = 0;
+        size_t gpu_shared = 0;
+        size_t npu_resident = 0;
+        for (const auto& op : model->get_ops()) {
+            auto c = std::dynamic_pointer_cast<ov::op::v0::Constant>(op);
+            if (!c || c->get_byte_size() < kMinRelocateBytes) {
+                continue;
+            }
+            const size_t bytes = c->get_byte_size();
+            auto buf = ov::npuw::SharedWeightBuffer::create_empty(gpu_ctx, bytes, /*zero=*/false);
+            std::memcpy(buf->host_ptr, c->get_data_ptr(), bytes);
+            if (npu_ctx) {
+                buf->import_into_npu_l0(npu_ctx);
+            }
+            auto so = std::static_pointer_cast<void>(buf);  // keeps the shared buffer alive
+            auto new_c =
+                std::make_shared<ov::op::v0::Constant>(c->get_element_type(), c->get_shape(), buf->host_ptr, so);
+            new_c->set_friendly_name(c->get_friendly_name());
+            ov::copy_runtime_info(c, new_c);
+            // Preserve the weightless-cache attribute: copy_runtime_info drops it (is_copyable()==false),
+            // and without it NPUW's Const wrapper treats every relocated weight as a brand-new Constant
+            // and eagerly copies it to host (a full second ~2 GB copy at partition time).
+            // CAVEAT (under investigation): keeping the weightless attr may make NPUW reconstruct the GPU
+            // prefill submodel's constants from the original .bin mmap (off our malloc) -> GPU share_usm
+            // sees in_range=0. Toggle via XPU_NO_WEIGHTLESS_ATTR=1 to test the GPU-share path.
+            if (!std::getenv("XPU_NO_WEIGHTLESS_ATTR")) {
+                ov::copy_weightless_cache_attr(c, new_c);
+            }
+            ov::replace_node(c, new_c);
+            if (!rs.str().empty()) {
+                rs << ";";
+            }
+            rs << reinterpret_cast<uint64_t>(buf->host_ptr) << ":" << buf->alloc_size;
+            if (buf->gpu_l0_imported) {
+                ++gpu_shared;
+            }
+            if (buf->npu_l0_imported) {
+                ++npu_resident;
+            }
+            total_bytes += bytes;
+            m_shared_weight_buffers.push_back(std::move(buf));
+        }
+        m_xpu_weight_ranges = rs.str();
+        // Tag the model with the shared-buffer ranges so the intel_gpu plugin's constant op wraps these
+        // exact USM-host pointers via share_usm (zero-copy) instead of allocating a device copy. This
+        // rt_info is inherited by the prefill/generate clones below; the NPU plugin ignores it (it uses
+        // XPU_RAW_WEIGHT_RANGES on the bank instead). Only meaningful when buffers reached the GPU-L0 ctx.
+        if (!m_xpu_weight_ranges.empty() && gpu_shared > 0) {
+            model->set_rt_info(m_xpu_weight_ranges, "xpu_shared_weight_ranges");
+        }
+        LOG_INFO("[NPUW] XPU_HYBRID_SHARED_WEIGHTS: relocated " << m_shared_weight_buffers.size()
+                 << " weight constants (" << (total_bytes / 1048576.0) << " MB), " << gpu_shared
+                 << " imported into GPU-L0 (shared); " << (m_shared_weight_buffers.size() - gpu_shared)
+                 << " NPU-only.");
+        ::ov::npuw::xpu_dbg() << "[NPUW] XPU_HYBRID_SHARED_WEIGHTS: relocated " << m_shared_weight_buffers.size()
+                 << " constants (" << (total_bytes / 1048576.0) << " MB), gpu_l0_imported=" << gpu_shared
+                 << "/" << m_shared_weight_buffers.size() << ", npu_l0_resident=" << npu_resident
+                 << "/" << m_shared_weight_buffers.size() << ", gpu_ctx=" << (gpu_ctx ? "OK" : "NULL")
+                 << ", npu_ctx=" << (npu_ctx ? "OK" : "NULL") << std::endl;
+    }
     auto use_eagle_key = pop_option(other_props, std::string("NPUW_EAGLE"));
 
     // Remove map-valued section configs before m_cfg.update(any_copy(...)), since Config expects string options.
@@ -835,8 +926,49 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     const uint32_t seq_len_dim = m_cfg.get<::intel_npu::NPUW_LLM_SEQ_LEN_DIM>();
     KVAxesPosition axes{batch_dim, seq_len_dim};
 
+    // [XPU-DIAG] Count how many large weight Constants still view the shared buffer (data ptr in
+    // m_xpu_weight_ranges) at each clone/transform stage, to pinpoint where the GPU prefill loses
+    // the relocated pointers (manifests as in_range=0 in the intel_gpu constant op).
+    std::vector<std::pair<uint64_t, uint64_t>> xpu_dbg_ranges;
+    if (!m_xpu_weight_ranges.empty()) {
+        std::stringstream rss(m_xpu_weight_ranges);
+        std::string tok;
+        while (std::getline(rss, tok, ';')) {
+            auto colon = tok.find(':');
+            if (colon != std::string::npos) {
+                uint64_t p = std::stoull(tok.substr(0, colon));
+                uint64_t s = std::stoull(tok.substr(colon + 1));
+                xpu_dbg_ranges.emplace_back(p, p + s);
+            }
+        }
+    }
+    auto xpu_count_in_range = [&xpu_dbg_ranges](const std::shared_ptr<ov::Model>& m, const char* tag) {
+        if (xpu_dbg_ranges.empty()) {
+            return;
+        }
+        size_t in = 0, big = 0;
+        for (const auto& op : m->get_ops()) {
+            auto c = std::dynamic_pointer_cast<ov::op::v0::Constant>(op);
+            if (!c || c->get_byte_size() < 4096) {
+                continue;
+            }
+            ++big;
+            auto p = reinterpret_cast<uint64_t>(c->get_data_ptr());
+            for (const auto& r : xpu_dbg_ranges) {
+                if (p >= r.first && p < r.second) {
+                    ++in;
+                    break;
+                }
+            }
+        }
+        ::ov::npuw::xpu_dbg() << "[XPU-DIAG] " << tag << ": " << in << "/" << big
+                              << " large constants view shared buffer" << std::endl;
+    };
+
     LOG_DEBUG("Creating kvcache model as clone of passed one.");
     auto kvcache_model = model->clone();
+    xpu_count_in_range(model, "model(after reloc)");
+    xpu_count_in_range(kvcache_model, "kvcache_model(clone)");
 
     auto use_text_embed_key = pop_option(other_props, std::string("NPUW_TEXT_EMBED"));
     m_is_embedding = use_text_embed_key.value_or(false).as<bool>() == true;
@@ -869,6 +1001,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     LOG_DEBUG("Creating prefill model as clone of transformed kvcache one.");
     auto prefill_model = kvcache_model->clone();
     prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
+    xpu_count_in_range(kvcache_model, "kvcache_model(after transforms)");
+    xpu_count_in_range(prefill_model, "prefill_model(clone)");
 
     m_kvcache_desc =
         KVCacheDesc{max_prompt_len, max_prompt_len + min_response_len, 0u, seq_len_dim, max_generation_token_len};
@@ -926,6 +1060,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                                   true)
             .run_on_model(prefill_model);
     }
+    xpu_count_in_range(prefill_model, "prefill_model(after ReshapeToStatic)");
     LOG_DEBUG("Make kvcache model with static shapes");
 
     // Create generate model variants with different sizes
@@ -1086,6 +1221,13 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         auto xpu_ranges_it = properties.find("XPU_RAW_WEIGHT_RANGES");
         if (xpu_ranges_it != properties.end()) {
             m_weights_bank->set_xpu_raw_ranges(xpu_ranges_it->second.as<std::string>());
+        } else if (!m_xpu_weight_ranges.empty()) {
+            // NPUW-native shared-weights path: the constants were relocated above into dual-L0
+            // buffers; register their ranges so the bank stores zero-copy VIEWS (GPU + NPU device
+            // banks both point at the same physical buffer) instead of materializing per-device copies.
+            m_weights_bank->set_xpu_raw_ranges(m_xpu_weight_ranges);
+            ::ov::npuw::xpu_dbg() << "[NPUW] XPU_HYBRID_SHARED_WEIGHTS: set_xpu_raw_ranges on bank '"
+                                  << m_weights_bank_name << "'" << std::endl;
         }
     }
 

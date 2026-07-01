@@ -15,6 +15,7 @@ namespace npuw {
 class LLMInferRequest;
 class WhisperInferRequest;
 struct PrefixCacheRestorationContext;
+struct SharedWeightBuffer;
 class LLMCompiledModel : public ov::npuw::ICompiledModel {
     using GetPropertiesMap =
         std::map<std::string, std::tuple<ov::PropertyMutability, std::function<ov::Any(const ::intel_npu::Config&)>>>;
@@ -91,6 +92,10 @@ private:
     std::string m_name;
     std::string m_weights_bank_name;
     std::shared_ptr<ov::npuw::weights::Bank> m_weights_bank;
+    // XPU hybrid shared weights (NPUW-native port of the intel_xpu mechanism): per-weight host
+    // buffers dual-L0-imported into GPU+NPU; kept alive for the compiled model's lifetime.
+    std::vector<std::shared_ptr<ov::npuw::SharedWeightBuffer>> m_shared_weight_buffers;
+    std::string m_xpu_weight_ranges;  // serialized "ptr:size;..." registered with the bank
     std::shared_ptr<::intel_npu::OptionsDesc> m_options_desc;
     ::intel_npu::Config m_cfg;
     GetPropertiesMap m_prop_to_opt;

@@ -10,6 +10,8 @@
 
 #include "logging.hpp"
 #include "openvino/core/parallel.hpp"
+#include "openvino/runtime/intel_gpu/remote_properties.hpp"
+#include "openvino/runtime/iremote_tensor.hpp"
 #include "serialization.hpp"
 #include "util.hpp"
 
@@ -281,6 +283,46 @@ void Bank::set_xpu_raw_ranges(const std::string& serialized) {
         pos = semi + 1;
     }
     LOG_INFO("XPU raw ranges set: " << m_xpu_raw_ranges.size() << " buffers");
+}
+
+ov::Tensor Bank::wrap_gpu_usm_if_resident(const ov::Tensor& host_view, const std::string& device, bool& wrapped) {
+    wrapped = false;
+    // Only meaningful for a GPU submodel when raw ranges (the dual-L0 shared malloc) are registered.
+    if (m_xpu_raw_ranges.empty() || !host_view || !ov::npuw::util::starts_with(device, "GPU")) {
+        return host_view;
+    }
+    const auto* p = static_cast<const uint8_t*>(host_view.data());
+    const auto bytes = host_view.get_byte_size();
+    bool resident = false;
+    for (const auto& [raw, size] : m_xpu_raw_ranges) {
+        const auto* rp = static_cast<const uint8_t*>(raw);
+        if (p >= rp && p + bytes <= rp + size) {
+            resident = true;
+            break;
+        }
+    }
+    if (!resident) {
+        return host_view;
+    }
+    // The malloc was imported into the GPU's L0 context (zeMemAllocHost), so it is a valid USM
+    // allocation there. Wrap it as a USM_USER remote tensor (zero-copy) instead of letting the GPU
+    // plugin allocate a device buffer and copy the weight in.
+    try {
+        auto gpu_ctx = m_core->get_default_context("GPU");
+        ov::AnyMap params = {
+            {ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_USER_BUFFER},
+            {ov::intel_gpu::mem_handle.name(), const_cast<void*>(host_view.data())},
+        };
+        ov::SoPtr<ov::IRemoteTensor> remote =
+            gpu_ctx._ptr->create_tensor(host_view.get_element_type(), host_view.get_shape(), params);
+        ov::SoPtr<ov::ITensor> as_itensor(remote._ptr, remote._so);
+        wrapped = true;
+        return ov::make_tensor(as_itensor);
+    } catch (const std::exception& e) {
+        ::ov::npuw::xpu_dbg() << "[NPUW] wrap_gpu_usm_if_resident: GPU USM wrap failed (" << e.what()
+                              << "), falling back to host view (GPU will copy)" << std::endl;
+        return host_view;
+    }
 }
 
 void* Bank::raw_resident_ptr(const StoredTensor& stored) const {

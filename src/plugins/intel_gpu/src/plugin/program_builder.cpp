@@ -118,6 +118,11 @@ ProgramBuilder::ProgramBuilder(std::shared_ptr<ov::Model> model, cldnn::engine& 
     if (m_model && m_model->has_rt_info("xpu_shared_weight_ranges")) {
         set_shared_weight_ranges(m_model->get_rt_info<std::string>("xpu_shared_weight_ranges"));
     }
+    if (std::getenv("OV_XPU_DEBUG")) {
+        std::cerr << "[XPU-ZC] ProgramBuilder model='" << (m_model ? m_model->get_friendly_name() : "<null>")
+                  << "' has_rt_info=" << (m_model && m_model->has_rt_info("xpu_shared_weight_ranges"))
+                  << " parsed_ranges=" << m_shared_weight_ranges.size() << std::endl;
+    }
 
     GPU_DEBUG_LOG << "Build model name: " << m_model->get_name() << " friendly name: " << m_model->get_friendly_name() << std::endl;
     m_program = build(ops, is_inner_program);

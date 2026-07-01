@@ -61,6 +61,13 @@ public:
     // the serialized "ptr:size;ptr:size;..." range list.
     void set_xpu_raw_ranges(const std::string& serialized);
 
+    // If `host_view` is a plain host tensor whose data lies inside a registered XPU raw range
+    // (the dual-L0 shared malloc) and `device` is a GPU, wrap it as a zero-copy GPU USM_USER
+    // remote tensor so the GPU reads the shared buffer in place instead of the GPU plugin copying
+    // it into device memory. Otherwise returns `host_view` unchanged. Never throws (falls back).
+    // `wrapped` is set to true iff a zero-copy GPU remote tensor was produced.
+    ov::Tensor wrap_gpu_usm_if_resident(const ov::Tensor& host_view, const std::string& device, bool& wrapped);
+
 private:
     friend class ov::npuw::LLMCompiledModel;
     friend class ov::npuw::CompiledModel;

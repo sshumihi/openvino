@@ -38,6 +38,8 @@ target_link_libraries(${TARGET_NAME}
         openvino::npu_al
         openvino::reference
         openvino::npu_ops
+        openvino::zero_loader
+        ze_loader
 )
 
 target_include_directories(${TARGET_NAME}

@@ -4,11 +4,25 @@
 
 #include "intel_npu/utils/zero/zero_mem.hpp"
 
+#include <atomic>
+
 #include "intel_npu/utils/utils.hpp"
 #include "intel_npu/utils/zero/zero_api.hpp"
 #include "intel_npu/utils/zero/zero_utils.hpp"
 
 namespace intel_npu {
+
+namespace {
+std::atomic<uint64_t> g_zero_mem_alloc{0};
+std::atomic<uint64_t> g_zero_mem_import{0};
+}  // namespace
+
+uint64_t zero_mem_alloc_count() {
+    return g_zero_mem_alloc.load(std::memory_order_relaxed);
+}
+uint64_t zero_mem_import_count() {
+    return g_zero_mem_import.load(std::memory_order_relaxed);
+}
 
 ZeroMem::ZeroMem(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
                  const size_t bytes,
@@ -28,6 +42,7 @@ ZeroMem::ZeroMem(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
 
     _id = zeroUtils::get_l0_context_memory_allocation_id(_init_structs->getContext(), _ptr);
     OPENVINO_ASSERT(_id != 0, "Failed to get memory allocation id of the allocated memory");
+    g_zero_mem_alloc.fetch_add(1, std::memory_order_relaxed);
 }
 
 ZeroMem::ZeroMem(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
@@ -96,6 +111,7 @@ ZeroMem::ZeroMem(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
 
     _id = zeroUtils::get_l0_context_memory_allocation_id(_init_structs->getContext(), _ptr);
     OPENVINO_ASSERT(_id != 0, "Failed to get memory allocation id of the imported memory");
+    g_zero_mem_import.fetch_add(1, std::memory_order_relaxed);
 }
 
 void* ZeroMem::data() {
