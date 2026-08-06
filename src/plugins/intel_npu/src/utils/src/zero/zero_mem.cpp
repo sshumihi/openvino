@@ -4,11 +4,87 @@
 
 #include "intel_npu/utils/zero/zero_mem.hpp"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 #include "intel_npu/utils/utils.hpp"
 #include "intel_npu/utils/zero/zero_api.hpp"
 #include "intel_npu/utils/zero/zero_utils.hpp"
 
 namespace intel_npu {
+
+namespace {
+// WI-2026-014 step 0 census. Separates level-zero memory that this process allocates fresh from
+// memory that it imports from an existing host buffer, and names every refused import.
+// A refused import falls back to a fresh allocation plus a copy, which is a second body.
+// Enabled only by NPUW_MEM_CENSUS=1, so an unset run is byte-for-byte the old behaviour.
+// Writes to stderr, because NPUW logging at DEBUG moves RSS itself (K-OPT-005).
+bool census_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("NPUW_MEM_CENSUS");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+
+struct CensusTotals {
+    std::atomic<size_t> alloc_count{0}, alloc_bytes{0};
+    std::atomic<size_t> import_count{0}, import_bytes{0};
+    std::atomic<size_t> refused_count{0}, refused_bytes{0};
+};
+
+CensusTotals& totals() {
+    static CensusTotals t;
+    return t;
+}
+
+void census_alloc(size_t bytes) {
+    if (!census_on()) {
+        return;
+    }
+    const auto n = totals().alloc_count.fetch_add(1) + 1;
+    const auto b = totals().alloc_bytes.fetch_add(bytes) + bytes;
+    std::fprintf(stderr,
+                 "[ZEROMEM_CENSUS] alloc bytes=%zu total_count=%zu total_bytes=%zu (%.2f MiB)\n",
+                 bytes,
+                 n,
+                 b,
+                 static_cast<double>(b) / (1024.0 * 1024.0));
+    std::fflush(stderr);
+}
+
+void census_import(size_t bytes) {
+    if (!census_on()) {
+        return;
+    }
+    const auto n = totals().import_count.fetch_add(1) + 1;
+    const auto b = totals().import_bytes.fetch_add(bytes) + bytes;
+    std::fprintf(stderr,
+                 "[ZEROMEM_CENSUS] import bytes=%zu total_count=%zu total_bytes=%zu (%.2f MiB)\n",
+                 bytes,
+                 n,
+                 b,
+                 static_cast<double>(b) / (1024.0 * 1024.0));
+    std::fflush(stderr);
+}
+
+void census_refused(size_t bytes, const char* reason) {
+    if (!census_on()) {
+        return;
+    }
+    const auto n = totals().refused_count.fetch_add(1) + 1;
+    const auto b = totals().refused_bytes.fetch_add(bytes) + bytes;
+    std::fprintf(stderr,
+                 "[ZEROMEM_CENSUS] refused bytes=%zu reason=%s total_count=%zu total_bytes=%zu (%.2f MiB)\n",
+                 bytes,
+                 reason,
+                 n,
+                 b,
+                 static_cast<double>(b) / (1024.0 * 1024.0));
+    std::fflush(stderr);
+}
+}  // anonymous namespace
 
 ZeroMem::ZeroMem(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
                  const size_t bytes,
@@ -28,6 +104,8 @@ ZeroMem::ZeroMem(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
 
     _id = zeroUtils::get_l0_context_memory_allocation_id(_init_structs->getContext(), _ptr);
     OPENVINO_ASSERT(_id != 0, "Failed to get memory allocation id of the allocated memory");
+
+    census_alloc(_size);
 }
 
 ZeroMem::ZeroMem(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
@@ -40,10 +118,12 @@ ZeroMem::ZeroMem(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
       _size(bytes) {
     if (standard_allocation) {
         if (!_init_structs->isExternalMemoryStandardAllocationSupported()) {
+            census_refused(_size, "driver_no_standard_allocation_support");
             throw ZeroMemException("Importing standard allocation is not supported with this driver version");
         }
 
         if (!utils::memory_and_size_aligned_to_standard_page_size(data, _size)) {
+            census_refused(_size, "not_page_aligned");
             throw ZeroMemException(
                 "Importing standard allocation is not supported if memory is not aligned to standard page size");
         }
@@ -55,6 +135,7 @@ ZeroMem::ZeroMem(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
         if (_size > 0 && zeroUtils::get_l0_context_memory_allocation_id(
                              _init_structs->getContext(),
                              static_cast<void*>(static_cast<uint8_t*>(const_cast<void*>(data)) + _size - 1)) > 0) {
+            census_refused(_size, "part_of_existing_allocation");
             throw ZeroMemException("Can not import a memory which is part of an existing allocation");
         }
 
@@ -70,6 +151,7 @@ ZeroMem::ZeroMem(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
         auto result = zeMemAllocHost(_init_structs->getContext(), &desc, _size, utils::STANDARD_PAGE_SIZE, &_ptr);
 
         if (result != ZE_RESULT_SUCCESS) {
+            census_refused(_size, ze_result_to_string(result).c_str());
             throw ZeroMemException("Importing memory failed with result " + ze_result_to_string(result) + " - " +
                                    ze_result_to_description(result).c_str());
         }
@@ -98,6 +180,8 @@ ZeroMem::ZeroMem(const std::shared_ptr<ZeroInitStructsHolder>& init_structs,
 
     _id = zeroUtils::get_l0_context_memory_allocation_id(_init_structs->getContext(), _ptr);
     OPENVINO_ASSERT(_id != 0, "Failed to get memory allocation id of the imported memory");
+
+    census_import(_size);
 }
 
 void* ZeroMem::data() {

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#include <cstdio>
+#include <cstdlib>
 #include <queue>
 #include "llm_compiled_model.hpp"
 
@@ -810,6 +812,23 @@ const ov::AnyMap& properties) {
         weight_shared_sources_pool.push(bank);
     }
     OPENVINO_ASSERT(!weight_shared_sources_pool.empty(), "[NPUW] SHARED_WEIGHTS: failed to allocate shared weight sources.");
+    // WI-2026-014 step 0 census. The producer bank is the first of the two live bodies, so its size
+    // has to appear in the same stream as the bank and level-zero counters that look for the second.
+    // Enabled only by NPUW_MEM_CENSUS=1. Written to stderr, and not through LOG_INFO, because NPUW
+    // logging is itself an RSS variable (K-OPT-005).
+    if (const char* census = std::getenv("NPUW_MEM_CENSUS"); census && census[0] != '\0' && census[0] != '0') {
+        size_t producer_bytes = 0;
+        for (size_t bank_size : bank_sizes) {
+            producer_bytes += bank_size;
+        }
+        std::fprintf(stderr,
+                     "[PRODUCER_CENSUS] shared_banks=%zu constants=%zu bytes=%zu (%.2f MiB)\n",
+                     bank_sizes.size(),
+                     constant_to_share.size(),
+                     producer_bytes,
+                     static_cast<double>(producer_bytes) / (1024.0 * 1024.0));
+        std::fflush(stderr);
+    }
     LOG_INFO("[NPUW] SHARED_WEIGHTS: allocated shared weight sources count:" << weight_shared_sources_pool.size() 
              << ", total size: " << total_bytes_can_be_occupied_by_shared_constants);
     size_t shared_bank_buffer_offset = 0;

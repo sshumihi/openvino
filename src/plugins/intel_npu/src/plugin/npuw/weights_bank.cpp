@@ -4,6 +4,9 @@
 
 #include "weights_bank.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "logging.hpp"
 #include "openvino/core/parallel.hpp"
 #include "serialization.hpp"
@@ -11,6 +14,20 @@
 
 using ov::npuw::weights::Bank;
 using ov::npuw::weights::LazyTensor;
+
+namespace {
+// WI-2026-014 step 0 census. Reports what the NPUW weights bank actually holds, per device.
+// Enabled only by NPUW_MEM_CENSUS=1 so that a recorded RSS run is unaffected when it is unset.
+// Writes to stderr and not through NPUW logging, because NPUW DEBUG logging itself moves RSS
+// (K-OPT-005). Remove together with the census work.
+bool census_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("NPUW_MEM_CENSUS");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+}  // anonymous namespace
 
 class BankManager {
 public:
@@ -109,7 +126,38 @@ void Bank::evaluate_and_allocate() {
         } else {
             evaluate_and_allocate_on_device(device_bank, to_process, device_for_alloc);
         }
+
+        if (census_on()) {
+            // Count what this device bank now owns. `to_process` is what this call allocated,
+            // and `storage` is the running total for the bank.
+            std::size_t allocated_entries = 0u, allocated_bytes = 0u;
+            for (const auto& el : device_bank.storage) {
+                if (el.second.tensor) {
+                    ++allocated_entries;
+                    allocated_bytes += el.second.tensor.get_byte_size();
+                }
+            }
+            std::fprintf(stderr,
+                         "[NPUW_MEM_CENSUS] bank=%s device=%s processed_now=%zu entries=%zu bytes=%zu (%.2f MiB)\n",
+                         m_bank_name.c_str(),
+                         device_for_alloc.c_str(),
+                         to_process.size(),
+                         allocated_entries,
+                         allocated_bytes,
+                         static_cast<double>(allocated_bytes) / (1024.0 * 1024.0));
+            std::fflush(stderr);
+        }
     }  // for (m_device_banks)
+
+    if (census_on()) {
+        // Printed even when there is no device bank at all, so that silence means "no census build"
+        // and never "the bank is empty".
+        std::fprintf(stderr,
+                     "[NPUW_MEM_CENSUS] bank=%s total_device_banks=%zu\n",
+                     m_bank_name.c_str(),
+                     m_device_banks.size());
+        std::fflush(stderr);
+    }
 }
 
 void Bank::evaluate_cpu(Bank::DeviceBank& device_bank, const std::vector<LazyTensor>& to_process) {
