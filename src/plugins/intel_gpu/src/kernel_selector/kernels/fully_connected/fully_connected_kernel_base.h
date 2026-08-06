@@ -6,6 +6,7 @@
 
 #include "weight_bias_kernel_base.h"
 #include "fully_connected_params.h"
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -72,5 +73,22 @@ protected:
 
     bool Validate(const Params& p) const override;
     void GetUpdateDispatchDataFunc(KernelData& kd) const override;
+
+    // Cross-plugin weight sharing: the tuned INT4/UINT4 FC kernels require a blocked weight layout,
+    // so the plugin repacks the weight at compile time and a private device copy appears even when
+    // the constant was imported zero-copy from a shared host bank. Declining those kernels makes the
+    // selector fall back to FullyConnected_bfyx_Ref, which reads plain oiyx and needs no reorder.
+    //
+    // This switch is process-global and therefore a measurement aid, not a shippable option: it
+    // declines the tuned kernel for *every* compressed i4 FC, including models with no shared
+    // weights at all. The per-weight form is tractable — ProgramBuilder::remote_constant_ids
+    // already records exactly which constants were imported — but needs that flag plumbed from the
+    // plugin layer into fully_connected_params. Naming a real option is a review question.
+    static bool decline_blocked_i4_for_shared_weights(const fully_connected_params& fc_params) {
+        static const bool enabled = (std::getenv("OV_SHARED_WEIGHTS_NO_REPACK") != nullptr);
+        return enabled && fc_params.compressed &&
+               (fc_params.weights.GetDType() == WeightsType::INT4 ||
+                fc_params.weights.GetDType() == WeightsType::UINT4);
+    }
 };
 }  // namespace kernel_selector
