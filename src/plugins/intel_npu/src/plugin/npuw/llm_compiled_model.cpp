@@ -860,6 +860,17 @@ const ov::AnyMap& properties) {
         }
         ov::replace_node(non_shared_constant, shared_constant);
 
+        // The bank now owns an authoritative copy of these bytes, so the original weight pages are
+        // dead weight. For an IR loaded from disk the source is a SharedBuffer<MappedMemory>
+        // (ir/src/frontend.cpp), whose hint_evict() unmaps the backing view, and the process gives
+        // the pages back. Without this the peak holds the .bin mapping and the bank at once, which
+        // is the whole weight body twice. convert_precision.cpp:1380 uses the same call in the same
+        // position: replace the node, then evict the node it replaced.
+        // Opt-out only, because an evicted range faults back in on demand and cannot lose data.
+        if (!std::getenv("NO_SHARED_WEIGHTS_EVICT")) {
+            ov::weight_sharing::Extension::hint_evict(*non_shared_constant);
+        }
+
         shared_bank_buffer_offset += size_of_constant_aligned;
 
         // Register this constant's (source_id, offset) → metadata in m_weight_registry.
