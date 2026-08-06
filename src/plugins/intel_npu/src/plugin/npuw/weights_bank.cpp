@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include "logging.hpp"
+#include "openvino/core/memory_util.hpp"
 #include "openvino/core/parallel.hpp"
 #include "serialization.hpp"
 #include "util.hpp"
@@ -199,6 +200,40 @@ void Bank::evaluate_and_allocate_on_device(Bank::DeviceBank& device_bank,
         auto uid = iter_device_registered->second;
         uids_to_allocated.push_back({lt.eval_meta(), ov::Tensor(), uid});
     }
+
+    if (census_on()) {
+        // How many of this device bank's entries hold the constant's own bytes, unmodified?
+        // Only those can ever be imported from the SHARED_WEIGHTS bank instead of copied into a
+        // fresh device allocation - a Permute or an Unpack produces bytes the shared bank does not
+        // contain. Byte totals alone cannot answer this: Permute preserves size. Counted here and
+        // not inferred from source, because the mix is per model.
+        std::size_t plain_n = 0, plain_b = 0, tr_n = 0, tr_b = 0;
+        for (const auto& lt : to_process) {
+            const auto trs = lt.get_transformations();
+            const auto meta = lt.eval_meta();
+            // get_memory_size, not type.size() * shape_size: the latter counts a sub-byte type as
+            // one byte per element and so doubles every int4 weight.
+            const std::size_t bytes = ov::util::get_memory_size(meta.type, ov::shape_size(meta.shape));
+            const bool plain = trs.size() == 1 && std::holds_alternative<ov::npuw::weights::op::Const>(trs.front());
+            if (plain) {
+                ++plain_n;
+                plain_b += bytes;
+            } else {
+                ++tr_n;
+                tr_b += bytes;
+            }
+        }
+        std::fprintf(stderr,
+                     "[NPUW_MEM_CENSUS] bank=%s device=%s plain_const=%zu (%.2f MiB) transformed=%zu (%.2f MiB)\n",
+                     m_bank_name.c_str(),
+                     device.c_str(),
+                     plain_n,
+                     static_cast<double>(plain_b) / (1024.0 * 1024.0),
+                     tr_n,
+                     static_cast<double>(tr_b) / (1024.0 * 1024.0));
+        std::fflush(stderr);
+    }
+
     // Sort by UIDs, lowest first
     std::sort(uids_to_allocated.begin(),
               uids_to_allocated.end(),
