@@ -102,6 +102,13 @@ public:
     void detach();
     void serialize(ov::npuw::orc::Stream& stream);
 
+    // WI-2026-014 R5a. Gives back the source Constant, so that a caller can ask whether the
+    // constant's bytes already sit in a SHARED_WEIGHTS bank and can be aliased instead of copied.
+    // Null on the weightless import path and after detach().
+    const std::shared_ptr<ov::op::v0::Constant>& node() const {
+        return m_node;
+    }
+
 private:
     std::shared_ptr<ov::op::v0::Constant> m_node = nullptr;
     ov::element::Type m_cached_type;

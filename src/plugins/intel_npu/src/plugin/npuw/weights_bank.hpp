@@ -9,10 +9,13 @@
 #include <tuple>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "lazy_tensor.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/runtime/aligned_buffer.hpp"
+#include "openvino/runtime/iremote_tensor.hpp"
+#include "openvino/runtime/so_ptr.hpp"
 #include "openvino/runtime/iplugin.hpp"
 #include "openvino/runtime/iremote_context.hpp"
 #include "openvino/runtime/make_tensor.hpp"
@@ -90,6 +93,11 @@ private:
 
     void serialize(ov::npuw::orc::Stream& stream);
     void read_and_add_tensor(ov::npuw::orc::Stream& stream, int64_t uid, const std::string& device);
+
+    // WI-2026-014 R5a. One level-zero import per SHARED_WEIGHTS bank that this weights bank aliases.
+    // Held for the life of the Bank, because every aliased entry points into the imported range and
+    // the level-zero allocation must outlive them. Empty when nothing was imported.
+    std::vector<ov::SoPtr<ov::IRemoteTensor>> m_imported_shared_banks;
 
     mutable std::mutex m_mutex;
     std::shared_ptr<const ov::ICore> m_core = nullptr;

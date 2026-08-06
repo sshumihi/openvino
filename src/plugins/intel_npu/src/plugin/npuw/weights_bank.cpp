@@ -8,10 +8,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 
 #include "logging.hpp"
 #include "openvino/core/memory_util.hpp"
 #include "openvino/core/parallel.hpp"
+#include "openvino/runtime/intel_npu/remote_properties.hpp"
 #include "serialization.hpp"
 #include "util.hpp"
 
@@ -303,16 +305,109 @@ void Bank::evaluate_and_allocate_on_device(Bank::DeviceBank& device_bank,
 
     // Allocate memory sequentially - in order of UID
     auto remote_ctx = m_core->get_default_context(device)._ptr;
-    for (auto&& allocated : uids_to_allocated) {
+
+    // WI-2026-014 R5a. An entry whose bytes already sit in a SHARED_WEIGHTS bank needs no second
+    // body. The bank is page-aligned in both its base and its size, so level zero imports it whole.
+    // Each such entry then aliases its own slice of the imported range, and the level-zero memory
+    // pool resolves that slice back to this one import when the runtime binds the tensor
+    // (zero_mem_pool.cpp, the "found one weak pointer in the pool" branch). Nothing is copied.
+    //
+    // The bank is imported whole and not slice by slice on purpose. A slice carries the constant's
+    // own byte count, which is not page-aligned, and the import refuses a size that is not page
+    // aligned (zero_mem.cpp). The whole-bank import has no such problem and it also keeps the
+    // import count at one per bank instead of one per weight.
+    std::vector<const void*> alias_ptr(uids_to_allocated.size(), nullptr);
+    std::size_t aliased_n = 0, aliased_b = 0, copied_n = 0, copied_b = 0;
+    if (device == "NPU") {
+        // Which banks does this device bank read from, and which entries can alias them?
+        std::map<const void*, std::size_t> banks_to_import;
+        for (std::size_t idx = 0; idx < uids_to_allocated.size(); ++idx) {
+            const auto& lt = device_bank.storage.at(uids_to_allocated[idx].uid).lt;
+            const auto trs = lt.get_transformations();
+            if (trs.size() != 1) {
+                continue;  // a transformed tensor's bytes do not exist in the bank
+            }
+            const auto* as_const = std::get_if<ov::npuw::weights::op::Const>(&trs.front());
+            if (as_const == nullptr) {
+                continue;
+            }
+            const auto& node = as_const->node();
+            if (!node) {
+                continue;  // weightless import path, or already detached
+            }
+            const void* data = node->get_data_ptr();
+            const auto found = find_shared_bank(data, node->get_byte_size());
+            if (found.first == nullptr) {
+                continue;
+            }
+            alias_ptr[idx] = data;
+            banks_to_import[found.first] = found.second;
+        }
+
+        for (const auto& b : banks_to_import) {
+            try {
+                // The public remote-context route, so that no level-zero header is needed here.
+                // u8 with a flat shape gives an import size that is exactly the bank size.
+                ov::AnyMap params = {{ov::intel_npu::mem_type.name(), ov::intel_npu::MemType::CPU_VA},
+                                     {ov::intel_npu::mem_handle.name(), const_cast<void*>(b.first)}};
+                m_imported_shared_banks.push_back(
+                    remote_ctx->create_tensor(ov::element::u8, ov::Shape{b.second}, params));
+            } catch (const std::exception& e) {
+                // A refused import is not an error. Every entry of this bank falls back to the
+                // allocate-and-copy path below, which is what this function did before R5a.
+                LOG_WARN("[NPUW] R5a: could not import a shared weight bank, falling back to a copy: " << e.what());
+                for (std::size_t idx = 0; idx < alias_ptr.size(); ++idx) {
+                    if (alias_ptr[idx] != nullptr && find_shared_bank(alias_ptr[idx], 1).first == b.first) {
+                        alias_ptr[idx] = nullptr;
+                    }
+                }
+            }
+        }
+    }
+
+    for (std::size_t idx = 0; idx < uids_to_allocated.size(); ++idx) {
+        auto& allocated = uids_to_allocated[idx];
+        const std::size_t bytes = ov::util::get_memory_size(allocated.meta.type, ov::shape_size(allocated.meta.shape));
+        if (alias_ptr[idx] != nullptr) {
+            ++aliased_n;
+            aliased_b += bytes;
+            continue;  // no device allocation at all for this one
+        }
+        ++copied_n;
+        copied_b += bytes;
         ov::SoPtr<ov::ITensor> remote_tensor =
             remote_ctx->create_host_tensor(allocated.meta.type, allocated.meta.shape);
         allocated = {allocated.meta, ov::make_tensor(remote_tensor), allocated.uid};
+    }
+
+    if (census_on()) {
+        std::fprintf(stderr,
+                     "[NPUW_MEM_CENSUS] bank=%s device=%s aliased=%zu (%.2f MiB) copied=%zu (%.2f MiB) "
+                     "imported_banks=%zu\n",
+                     m_bank_name.c_str(),
+                     device.c_str(),
+                     aliased_n,
+                     static_cast<double>(aliased_b) / (1024.0 * 1024.0),
+                     copied_n,
+                     static_cast<double>(copied_b) / (1024.0 * 1024.0),
+                     m_imported_shared_banks.size());
+        std::fflush(stderr);
     }
 
     // Evaluate and copy into the device memory
     ov::parallel_for(uids_to_allocated.size(), [&](std::size_t idx) {
         auto& allocated = uids_to_allocated[idx];
         auto& stored_tensor = device_bank.storage.at(allocated.uid);
+
+        if (alias_ptr[idx] != nullptr) {
+            // Point at the bank in place. The LazyTensor is NOT detached here: it holds the
+            // Constant, which holds the slice, which holds the bank alive. Detaching it would drop
+            // the only reference this bank entry has to the memory it now points at.
+            stored_tensor.tensor = ov::Tensor(allocated.meta.type,
+                                              allocated.meta.shape,
+                                              const_cast<void*>(alias_ptr[idx]));
+            return;
+        }
 
         auto transformed = stored_tensor.lt.eval();
         transformed.copy_to(allocated.allocated_tensor);
