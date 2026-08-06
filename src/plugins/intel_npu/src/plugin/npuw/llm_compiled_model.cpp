@@ -1413,6 +1413,17 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         }
     }
 
+    // Hand the shared weight context that assign_shared_weight_to_model_if_possible() built to the
+    // submodel compiled models. MODEL_SHARING_CONTEXT carries no "NPUW" in its name, so
+    // split_properties() routes it into CompiledModel::m_non_npuw_props, and compile_submodel()
+    // forwards it from there into each per-device compile.
+    if (m_shared_ctx_ptr) {
+        const auto shared_ctx = ov::Any(std::make_shared<const ov::weight_sharing::Context>(*m_shared_ctx_ptr));
+        prefill_config[ov::internal::model_sharing_context.name()] = shared_ctx;
+        generate_config[ov::internal::model_sharing_context.name()] = shared_ctx;
+        LOG_INFO("[NPUW] SHARED_WEIGHTS: passing the shared weight context to the submodel compiles.");
+    }
+
     // Compile multiple generate model variants with different sizes
     compile_generate_model_variants(generate_model_variants, plugin, generate_config);
 

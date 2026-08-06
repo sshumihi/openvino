@@ -1909,6 +1909,18 @@ ov::SoPtr<ov::ICompiledModel> ov::npuw::CompiledModel::compile_submodel(const st
     // Make a device config COPY here!
     auto device_config = m_meta_devices[device];
 
+    // Carry the cross-plugin weight sharing context into the inner compile.
+    // The core only injects MODEL_SHARING_CONTEXT between two top-level compile_model calls, but the
+    // NPUW-LLM pipeline is a single outer call with the submodel compiles nested inside it. So the
+    // context has to be forwarded here, or the target plugin (GPU) receives a null context and
+    // silently allocates its own weight copies. Inject explicitly rather than relying on
+    // get_supported_property(), which may filter an internal property out of m_meta_devices.
+    if (const auto shared_ctx_it = m_non_npuw_props.find(ov::internal::model_sharing_context.name());
+        shared_ctx_it != m_non_npuw_props.end()) {
+        device_config[ov::internal::model_sharing_context.name()] = shared_ctx_it->second;
+        LOG_DEBUG("Forwarding MODEL_SHARING_CONTEXT to the " << device << " submodel compile.");
+    }
+
     if (ov::npuw::util::starts_with(device, "NPU") && m_cfg.get<::intel_npu::NPUW_UNFOLD_IREQS>()) {
         device_config["NPU_RUN_INFERENCES_SEQUENTIALLY"] = "YES";
     }
