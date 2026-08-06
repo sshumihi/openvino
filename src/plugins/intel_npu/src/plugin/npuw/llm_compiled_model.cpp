@@ -768,8 +768,33 @@ const ov::AnyMap& properties) {
     static constexpr size_t single_weigh_shared_source_size_max = static_cast<size_t>(2ULL * 1024 * 1024 * 1024);
     static std::atomic<size_t> s_bank_id_counter{1};
     std::queue<std::shared_ptr<AlignedBuffer>> weight_shared_sources_pool;
-    for (size_t bank_idx = 0; bank_idx < total_bytes_can_be_occupied_by_shared_constants; bank_idx += single_weigh_shared_source_size_max) {
-        size_t bank_size = std::min(single_weigh_shared_source_size_max, total_bytes_can_be_occupied_by_shared_constants - bank_idx);
+
+    // Pack the constants into banks first, then allocate each bank at exactly the size its own
+    // constants need. Chunking the running total into fixed 2 GiB pieces is wrong on two counts.
+    // A constant cannot straddle two banks, so the tail of a bank may be unusable and the total
+    // then under-allocates. And the final bank is smaller than the cap, so testing a constant
+    // against the cap rather than against that bank's real size writes past its end. Both surface
+    // as "Check 'data_in_src_range' failed" in shared_buffer.hpp, and only on a model whose
+    // shareable constants exceed 2 GiB: Phi-4-mini does, Qwen3-0.6B does not.
+    std::vector<size_t> bank_sizes;
+    {
+        size_t running = 0;
+        for (const auto& c : constant_to_share) {
+            const size_t bytes = align_bytes(c->get_byte_size());
+            OPENVINO_ASSERT(bytes <= single_weigh_shared_source_size_max,
+                            "[NPUW] SHARED_WEIGHTS: a single constant exceeds the 2GB shared buffer cap.");
+            if (running != 0 && running + bytes > single_weigh_shared_source_size_max) {
+                bank_sizes.push_back(running);
+                running = 0;
+            }
+            running += bytes;
+        }
+        if (running != 0) {
+            bank_sizes.push_back(running);
+        }
+    }
+
+    for (size_t bank_size : bank_sizes) {
         LOG_INFO("[NPUW] SHARED_WEIGHTS: allocating source buffer for weight bank " 
                  << s_bank_id_counter.load(std::memory_order_relaxed) 
                  << ", size: " << bank_size);
@@ -784,16 +809,19 @@ const ov::AnyMap& properties) {
     LOG_INFO("[NPUW] SHARED_WEIGHTS: allocated shared weight sources count:" << weight_shared_sources_pool.size() 
              << ", total size: " << total_bytes_can_be_occupied_by_shared_constants);
     size_t shared_bank_buffer_offset = 0;
+    size_t current_bank_capacity = 0;
     std::shared_ptr<AlignedBuffer> shared_buffer_pool;
     for (auto non_shared_constant : constant_to_share) {
         size_t size_of_constant_aligned = align_bytes(non_shared_constant->get_byte_size());
-        if (shared_bank_buffer_offset + size_of_constant_aligned > single_weigh_shared_source_size_max) {
+        // Roll over on the *current* bank's capacity, not on the global cap.
+        if (shared_buffer_pool && shared_bank_buffer_offset + size_of_constant_aligned > current_bank_capacity) {
             shared_bank_buffer_offset = 0;
         }
         if (shared_bank_buffer_offset == 0) {
             OPENVINO_ASSERT(!weight_shared_sources_pool.empty(), "[NPUW] SHARED_WEIGHTS: not enough shared weight sources.");
             shared_buffer_pool = weight_shared_sources_pool.front();
             weight_shared_sources_pool.pop();
+            current_bank_capacity = shared_buffer_pool->size();
             // Pre-register this bank as a cache source now that it has a valid descriptor ID.
             // All constants sliced from this bank will use the same source_id as the outer key.
             ov::weight_sharing::set_weight_source(*m_shared_ctx_ptr, shared_buffer_pool);
