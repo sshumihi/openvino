@@ -118,6 +118,14 @@ static void create_data(ProgramBuilder& p, const ov::Shape& const_shape, const s
             auto constant_id = weight_sharing::Extension::get_constant_id(*op);
             cross_device_weight_shared_buffer = weight_sharing::get_buffer(*p.get_weight_sharing_ctx(), constant_source_id, constant_id);
         }
+        // Attribute every constant to one of three outcomes, so a run can prove whether the import
+        // actually happened instead of inferring it from a memory number. "no source" means this
+        // constant was never registered by the producer (filtered, or not relocated); "lookup miss"
+        // means it was registered but the context could not resolve it, which is a wiring bug.
+        GPU_DEBUG_LOG << "[WS] " << op->get_friendly_name() << " bytes=" << op->get_byte_size()
+                      << (cross_device_weight_shared_buffer ? " -> SHARED import"
+                          : (source_buffer ? " -> lookup MISS" : " -> no source"))
+                      << std::endl;
     }
     const auto cache_key = std::make_tuple(data, const_shape, op->get_output_element_type(0), cross_device_weight_shared_buffer != nullptr);
 
