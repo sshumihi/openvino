@@ -14,6 +14,7 @@
 #include "llm_compiled_model_utils.hpp"
 #include "llm_infer_request.hpp"
 #include "logging.hpp"
+#include "weights_bank.hpp"
 #include "moe_transformations/apply_moe_device_routed_transforms.hpp"
 #include "npuw_transformations/add_position_ids_param.hpp"
 #include "npuw_transformations/convert_kvcache_to_precision.hpp"
@@ -809,6 +810,12 @@ const ov::AnyMap& properties) {
         // only weak_ptrs, so without this the bank is freed when this function returns and the GPU's
         // CL_MEM_USE_HOST_PTR imports are left pointing at released host pages.
         m_shared_weight_banks.push_back(bank);
+        // WI-2026-014 R5a. Declare the bank so that the NPUW weights bank can alias it instead of
+        // copying the same bytes into a second, level-zero body. Registration is the only reliable
+        // test: a .bin-mmapped Constant also carries a source descriptor, and only the producer
+        // knows which buffers it built. The registry holds a weak reference, so this adds no
+        // lifetime of its own.
+        ov::npuw::weights::register_shared_bank(raw);
         weight_shared_sources_pool.push(bank);
     }
     OPENVINO_ASSERT(!weight_shared_sources_pool.empty(), "[NPUW] SHARED_WEIGHTS: failed to allocate shared weight sources.");

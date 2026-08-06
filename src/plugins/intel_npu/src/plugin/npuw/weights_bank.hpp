@@ -8,9 +8,11 @@
 #include <mutex>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 
 #include "lazy_tensor.hpp"
 #include "openvino/op/constant.hpp"
+#include "openvino/runtime/aligned_buffer.hpp"
 #include "openvino/runtime/iplugin.hpp"
 #include "openvino/runtime/iremote_context.hpp"
 #include "openvino/runtime/make_tensor.hpp"
@@ -24,6 +26,23 @@ namespace npuw {
 class LLMCompiledModel;
 class CompiledModel;
 namespace weights {
+
+// WI-2026-014 R5a. The SHARED_WEIGHTS producer builds one page-aligned host bank per model and
+// points every shareable Constant at a slice of it. The NPU device bank used to copy those same
+// bytes into a second, level-zero allocation. It now aliases the bank instead, which needs an exact
+// answer to "does this pointer belong to a producer bank". The registry gives that answer.
+//
+// A structural test cannot give it. A Constant that is backed by the model's .bin mmap also carries
+// a source descriptor, and its slice can be page-aligned by chance. Only the producer knows which
+// buffers it built, so only the producer registers them.
+//
+// The registry holds weak references. An entry whose bank is gone is never matched and is pruned on
+// the next lookup, so a compiled model that is destroyed cannot leave an importable stale range.
+void register_shared_bank(const std::shared_ptr<ov::AlignedBuffer>& bank);
+
+// Answers whether [ptr, ptr + bytes) lies inside one registered bank. Gives back that bank's base
+// and size, which are both page-aligned by construction, or {nullptr, 0}.
+std::pair<const void*, std::size_t> find_shared_bank(const void* ptr, std::size_t bytes);
 
 class Bank {
 public:

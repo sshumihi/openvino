@@ -4,6 +4,8 @@
 
 #include "weights_bank.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
@@ -28,7 +30,65 @@ bool census_on() {
     }();
     return on;
 }
+
+// WI-2026-014 R5a. The registry of SHARED_WEIGHTS producer banks. See weights_bank.hpp for why the
+// producer has to declare them and a structural test cannot find them.
+struct SharedBankEntry {
+    std::weak_ptr<ov::AlignedBuffer> buffer;
+    const void* base = nullptr;
+    std::size_t size = 0;
+};
+
+std::mutex& shared_bank_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::vector<SharedBankEntry>& shared_banks() {
+    static std::vector<SharedBankEntry> banks;
+    return banks;
+}
 }  // anonymous namespace
+
+namespace ov {
+namespace npuw {
+namespace weights {
+
+void register_shared_bank(const std::shared_ptr<ov::AlignedBuffer>& bank) {
+    if (!bank || bank->size() == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(shared_bank_mutex());
+    shared_banks().push_back({bank, bank->get_ptr(), bank->size()});
+}
+
+std::pair<const void*, std::size_t> find_shared_bank(const void* ptr, std::size_t bytes) {
+    if (ptr == nullptr) {
+        return {nullptr, 0};
+    }
+    const auto* p = static_cast<const std::uint8_t*>(ptr);
+    std::lock_guard<std::mutex> guard(shared_bank_mutex());
+    auto& banks = shared_banks();
+    // Prune first. A destroyed compiled model releases its banks, and a stale range would otherwise
+    // still look importable.
+    banks.erase(std::remove_if(banks.begin(),
+                               banks.end(),
+                               [](const SharedBankEntry& e) {
+                                   return e.buffer.expired();
+                               }),
+                banks.end());
+    for (const auto& e : banks) {
+        const auto* base = static_cast<const std::uint8_t*>(e.base);
+        if (p >= base && p + bytes <= base + e.size) {
+            return {e.base, e.size};
+        }
+    }
+    return {nullptr, 0};
+}
+
+}  // namespace weights
+}  // namespace npuw
+}  // namespace ov
 
 class BankManager {
 public:
