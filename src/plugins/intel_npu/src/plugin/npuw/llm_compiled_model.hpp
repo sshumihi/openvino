@@ -167,6 +167,14 @@ private:
     // Exposed via get_property(ov::internal::model_sharing_context) so Core can
     // write it back into SingleFileStorage after compilation.
     std::unique_ptr<ov::weight_sharing::Context> m_shared_ctx_ptr;
+
+    // Strong references to the page-aligned weight banks that back the shared constants.
+    // The context itself only holds weak_ptrs (ov::weight_sharing::WeightSource::m_weights is a
+    // weak_ptr, see get_buffer()'s m_weights.lock()), so it keeps nothing alive. The GPU imports
+    // these banks with CL_MEM_USE_HOST_PTR, which means the host pages must outlive every compiled
+    // submodel that points into them. Without this vector the banks are freed once the producer's
+    // locals die, and inference fails with CL_OUT_OF_RESOURCES on a dangling host pointer.
+    std::vector<std::shared_ptr<ov::AlignedBuffer>> m_shared_weight_banks;
 };
 
 }  // namespace npuw

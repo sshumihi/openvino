@@ -800,10 +800,14 @@ const ov::AnyMap& properties) {
                  << ", size: " << bank_size);
         auto raw = std::make_shared<AlignedBuffer>(bank_size, kMinRelocateBytes);
         const size_t bank_id = s_bank_id_counter.fetch_add(1, std::memory_order_relaxed);
-        weight_shared_sources_pool.push(
-            std::make_shared<ov::SharedBuffer<std::shared_ptr<AlignedBuffer>>>(
-                raw->get_ptr<char>(), raw->size(), raw,
-                ov::create_base_descriptor(bank_id, 0, raw)));
+        auto bank = std::make_shared<ov::SharedBuffer<std::shared_ptr<AlignedBuffer>>>(
+            raw->get_ptr<char>(), raw->size(), raw,
+            ov::create_base_descriptor(bank_id, 0, raw));
+        // Keep a strong reference for the lifetime of this compiled model. The shared context stores
+        // only weak_ptrs, so without this the bank is freed when this function returns and the GPU's
+        // CL_MEM_USE_HOST_PTR imports are left pointing at released host pages.
+        m_shared_weight_banks.push_back(bank);
+        weight_shared_sources_pool.push(bank);
     }
     OPENVINO_ASSERT(!weight_shared_sources_pool.empty(), "[NPUW] SHARED_WEIGHTS: failed to allocate shared weight sources.");
     LOG_INFO("[NPUW] SHARED_WEIGHTS: allocated shared weight sources count:" << weight_shared_sources_pool.size() 
