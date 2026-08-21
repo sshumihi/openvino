@@ -20,18 +20,15 @@ inline constexpr NPUWProperty<Option> npuw_property{::intel_npu::NPUWOptionMeta<
 
 namespace ov::intel_npu::npuw {
 
-inline constexpr ov::Property<ov::FileHandleProvider> weights_handle_provider{"NPUW_WEIGHTS_HANDLE_PROVIDER"};
-
-// Sub-region of the handle returned by NPUW_WEIGHTS_HANDLE_PROVIDER that holds
-// the weights pool. When the size is non-zero, NPUW maps only
-// [offset, offset+size) out of the handle instead of the whole file, so the
-// mapped base coincides with the pool start and per-constant descriptor offsets
-// (which are pool-relative) resolve as mapped->data() + offset. See fd-backed
-// weight sharing (Option B): the pool is a region embedded inside a larger
-// model file. Two scalar properties (rather than a struct) so callers outside
-// this plugin can set them without depending on a private type.
-inline constexpr ov::Property<std::size_t> weights_handle_region_offset{"NPUW_WEIGHTS_HANDLE_REGION_OFFSET"};
-inline constexpr ov::Property<std::size_t> weights_handle_region_size{"NPUW_WEIGHTS_HANDLE_REGION_SIZE"};
+// The weights source for a weightless blob: a callback that yields a handle to the file holding the
+// weights pool, plus the window of that file the pool occupies. NPUW maps that window, so the mapped
+// base coincides with the pool start and each per-constant descriptor offset, which is pool-relative,
+// resolves as mapped->data() + offset. A pool that is the whole file needs no window, and
+// ov::FileRegion defaults to that.
+//
+// ov::FileRegion is a public type, so a caller outside this plugin sets this property without any
+// dependency on a plugin-private type.
+inline constexpr ov::Property<ov::FileRegionProvider> weights_handle_provider{"NPUW_WEIGHTS_HANDLE_PROVIDER"};
 
 namespace llm {
 

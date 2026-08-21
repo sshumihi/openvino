@@ -62,20 +62,15 @@ ov::Tensor Const::eval() const {
     }
 
     // Weightless import case. Mmmap CPU weight on demand to avoid allocating all weights at once.
-    if (!m_weights_path.empty() || m_handle_provider) {
+    if (!m_weights_path.empty() || m_region_provider) {
         NPUW_ASSERT(!m_read_from_bin &&
                     "Trying to read weight from weights file, but the weight has been already deserialized!");
         std::shared_ptr<ov::MappedMemory> mapped_memory;
-        // Use handle_provider if available, otherwise use default mmap
-        if (m_handle_provider) {
-            ov::FileHandle handle = m_handle_provider();
-            if (m_handle_region_size != 0) {
-                // Map only the weights pool sub-region so m_mmaped_weights->get_ptr(m_offset)
-                // resolves the pool-relative descriptor offset (fd-backed sharing, Option B).
-                mapped_memory = ov::load_mmap_object(handle, m_handle_region_offset, m_handle_region_size);
-            } else {
-                mapped_memory = ov::load_mmap_object(handle);
-            }
+        // Use region_provider if available, otherwise use default mmap
+        if (m_region_provider) {
+            // The provider names the pool window, so m_mmaped_weights->get_ptr(m_offset) resolves the
+            // pool-relative descriptor offset.
+            mapped_memory = ov::npuw::s11n::map_weights_region(m_region_provider);
         } else {
             mapped_memory = ov::load_mmap_object(ov::util::make_path(m_weights_path));
         }
@@ -94,7 +89,7 @@ LazyTensor::Meta Const::eval_meta() const {
     }
 
     // Weightless import case
-    if (!m_weights_path.empty() || m_handle_provider) {
+    if (!m_weights_path.empty() || m_region_provider) {
         return {m_cached_shape, m_cached_type};
     }
 
@@ -129,14 +124,12 @@ void Const::read_weight(const ov::npuw::s11n::WeightsContext& ctx) {
             // It doesn't introduce extra allocation, however it allows to gradually 1 by 1
             // read mmaped CPU weights and allocate them on device without loading all the weights first.
             // Thus the memory consumption during import is greatly reduced but at the slight cost of performance.
-            NPUW_ASSERT(!ctx.weights_path.empty() || ctx.handle_provider);
+            NPUW_ASSERT(!ctx.weights_path.empty() || ctx.region_provider);
             // Just save weights_path for the eval() to call the actual mmap.
             m_weights_path = ctx.weights_path;
-            // Also save handle_provider if available
-            m_handle_provider = ctx.handle_provider;
-            // Carry the pool sub-region so eval() maps the same window.
-            m_handle_region_offset = ctx.handle_region_offset;
-            m_handle_region_size = ctx.handle_region_size;
+            // Also save region_provider if available. It carries the pool window with the handle, so
+            // eval() cannot map a different window than the import did.
+            m_region_provider = ctx.region_provider;
         }
     } else {
         auto it = ctx.consts_cache.find({m_offset, m_byte_size});

@@ -23,6 +23,7 @@
 #include "host_flash_attention.hpp"
 #include "openvino/core/shape.hpp"
 #include "openvino/runtime/file_handle.hpp"
+#include "openvino/util/mmap_object.hpp"
 #include "orc.hpp"
 #include "pyramid_attention.hpp"
 #include "spatial.hpp"
@@ -152,16 +153,11 @@ struct WeightsContext {
 
     // NOTE: This constructor is used on blob import to carry the resolved weight source
     // (embedded weights, mmap'ed weights file, or model-backed constants cache).
-    // _handle_region_offset/_handle_region_size (when the latter is non-zero)
-    // restrict the mmap to a sub-region of the provided handle so descriptor
-    // offsets remain pool-relative (fd-backed weight sharing, Option B).
     WeightsContext(const ov::npuw::s11n::WeightsPtr& _weights,
                    const std::string& _weights_path,
                    const ConstsCache& _consts_cache,
                    const BF16Cache& _bf16_consts,
-                   const ov::FileHandleProvider& _handle_provider = nullptr,
-                   std::size_t _handle_region_offset = 0,
-                   std::size_t _handle_region_size = 0);
+                   const ov::FileRegionProvider& _region_provider = nullptr);
 
     WeightsContext& operator=(const WeightsContext& other) = default;
 
@@ -176,13 +172,14 @@ struct WeightsContext {
     std::string weights_path;
     ConstsCache consts_cache;
     BF16Cache bf16_consts;
-    ov::FileHandleProvider handle_provider = nullptr;
-    // Sub-region of the handle to map (size 0 => whole handle). Used so that
-    // mapped->data() points at the weights pool start and descriptor offsets
-    // resolve pool-relative (fd-backed weight sharing, Option B).
-    std::size_t handle_region_offset = 0;
-    std::size_t handle_region_size = 0;
+    // Yields the handle and the window inside it that holds the weights pool. The window makes
+    // mapped->data() point at the pool start, so a pool-relative descriptor offset resolves directly.
+    ov::FileRegionProvider region_provider = nullptr;
 };
+
+// Maps the region that `provider` hands out. A size of 0 maps the whole object rather than nothing,
+// because an empty mapping leaves MappedMemory::data() null and every later offset undefined.
+std::shared_ptr<ov::MappedMemory> map_weights_region(const ov::FileRegionProvider& provider);
 
 // Context for deserializing submodels with dynamic attention mechanisms
 // (Pyramid Attention, Host Flash Attention, etc.)

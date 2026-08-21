@@ -33,17 +33,21 @@ ov::npuw::s11n::WeightsContext::WeightsContext(const ov::npuw::s11n::WeightsPtr&
                                                const std::string& _weights_path,
                                                const s11n::WeightsContext::ConstsCache& _consts_cache,
                                                const BF16Cache& _bf16_consts,
-                                               const ov::FileHandleProvider& _handle_provider,
-                                               std::size_t _handle_region_offset,
-                                               std::size_t _handle_region_size)
+                                               const ov::FileRegionProvider& _region_provider)
     : weights(_weights),
       weights_path(_weights_path),
       consts_cache(_consts_cache),
       bf16_consts(_bf16_consts),
-      handle_provider(_handle_provider),
-      handle_region_offset(_handle_region_offset),
-      handle_region_size(_handle_region_size) {
+      region_provider(_region_provider) {
     is_weightless = _weights || !_consts_cache.empty();
+}
+
+std::shared_ptr<ov::MappedMemory> ov::npuw::s11n::map_weights_region(const ov::FileRegionProvider& provider) {
+    const ov::FileRegion region = provider();
+    // A provider that reports 0 bytes means the whole object, not an empty one. load_mmap_object
+    // skips the mapping entirely for a zero length, which would leave data() null.
+    const auto size = region.size == 0 ? ov::auto_size : region.size;
+    return ov::load_mmap_object(region.handle, region.offset, size);
 }
 
 ov::npuw::s11n::BF16Cache ov::npuw::s11n::get_bf16_consts(const std::shared_ptr<ov::Model>& model) {
